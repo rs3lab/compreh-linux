@@ -23,6 +23,12 @@
 #include <net/xdp.h>
 #include <asm/irqflags.h>
 
+#ifdef CONFIG_X86_64
+#define get_cycles_ordered() rdtsc_ordered()
+#else
+#define get_cycles_ordered() get_cycles()
+#endif
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/bpf_test_run.h>
 
@@ -41,17 +47,13 @@ static void bpf_test_timer_enter(struct bpf_test_timer *t)
 	else
 		migrate_disable();
 
-#ifdef CONFIG_X86_64
-	t->time_start = rdtsc_ordered();
-#else
-	t->time_start = ktime_get_ns();
-#endif
+	t->time_start = get_cycles_ordered();
 }
 
 static void bpf_test_timer_leave(struct bpf_test_timer *t)
 	__releases(rcu)
 {
-	t->time_spent += rdtsc_ordered() - t->time_start;
+	t->time_spent += get_cycles_ordered() - t->time_start;
 	t->time_start = 0;
 
 	if (t->mode == NO_PREEMPT)
@@ -94,11 +96,7 @@ static bool __bpf_test_timer_continue(struct bpf_test_timer *t, int iterations,
 	t->i += iterations;
 	if (t->i >= repeat) {
 		/* We're done. */
-#ifdef CONFIG_X86_64
-		t->time_spent += rdtsc_ordered() - t->time_start;
-#else
-		t->time_spent += ktime_get_ns() - t->time_start;
-#endif
+		t->time_spent += get_cycles_ordered() - t->time_start;
 		/* do_div(t->time_spent, t->i); */
 		t->time_spent = t->time_spent / t->i;
 		*duration = t->time_spent > U32_MAX ? U32_MAX : (u32)t->time_spent;
@@ -112,11 +110,7 @@ static bool __bpf_test_timer_continue(struct bpf_test_timer *t, int iterations,
 		goto reset;
 	}
 
-#ifdef CONFIG_X86_64
-	t->time_spent += rdtsc_ordered() - t->time_start;
-#else
-	t->time_spent += ktime_get_ns() - t->time_start;
-#endif
+	t->time_spent += get_cycles_ordered() - t->time_start;
 	bpf_test_timer_leave(t);
 	if (need_resched()) {
 		/* During iteration: we need to reschedule between runs. */
@@ -520,26 +514,26 @@ static int bpf_test_run_xdp(struct bpf_prog *prog, void *ctx, u32 repeat,
 	local_irq_save(flag);
 	old_ctx = bpf_set_run_ctx(&run_ctx.run_ctx);
 
-	start = rdtsc_ordered();
+	start = get_cycles_ordered();
 	for (i = 0; i < repeat; i++) {
 #ifdef CONFIG_BPFBOX_XDP_NOCOPY
 		memcpy(new_xdp, backup_xdp, sizeof(struct xdp_buff));
 		memcpy(pkt, backup_packet, PAGE_SIZE);
-		start = rdtsc_ordered();
+		start = get_cycles_ordered();
 		*retval = __bpf_prog_run(prog, bpf_box_ptr(new_xdp), BPF_DISPATCHER_FUNC(xdp));
-		total += rdtsc_ordered() - start;
+		total += get_cycles_ordered() - start;
 #else
-		total += rdtsc_ordered() - start;
+		total += get_cycles_ordered() - start;
 		memcpy(ctx, xdp, sizeof(struct xdp_buff));
 		memcpy(((struct xdp_buff*)ctx)->data_hard_start, packet, PAGE_SIZE);
-		start = rdtsc_ordered();
+		start = get_cycles_ordered();
 		/* bpf_test_timer_enter(&t); */
 		run_ctx.prog_item = &item;
 		*retval = bpf_prog_run_xdp(prog, ctx);
 		/* bpf_test_timer_leave(&t); */
 #endif
 	}
-	total += rdtsc_ordered() - start;
+	total += get_cycles_ordered() - start;
 	bpf_reset_run_ctx(old_ctx);
 
 	xdp_teardown_context(new_xdp, ctx, PAGE_SIZE);
@@ -586,18 +580,18 @@ static int bpf_test_run_skb(struct bpf_prog *prog, void *ctx, u32 repeat,
 		repeat = 1;
 
 	old_ctx = bpf_set_run_ctx(&run_ctx.run_ctx);
-	start = rdtsc_ordered();
+	start = get_cycles_ordered();
 	for (i = 0; i < repeat; i++) {
 #ifdef CONFIG_BPFBOX_XDP_NOCOPY
-		start = rdtsc_ordered();
+		start = get_cycles_ordered();
 		*retval = bpf_prog_run(prog, ctx);
-		total += rdtsc_ordered() - start;
+		total += get_cycles_ordered() - start;
 #else
 		run_ctx.prog_item = &item;
 		*retval = bpf_prog_run_skb(prog, ctx);
 #endif
 	}
-	total += rdtsc_ordered() - start;
+	total += get_cycles_ordered() - start;
 	*time = total / repeat;
 	bpf_reset_run_ctx(old_ctx);
 	local_irq_restore(flag);
