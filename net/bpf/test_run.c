@@ -38,6 +38,45 @@ struct bpf_test_timer {
 	u64 time_start, time_spent;
 };
 
+#if defined(CONFIG_X86_64)
+#define get_cycles_ordered() rdtsc_ordered()
+#define get_cycles_ordered_start() rdtsc_ordered()
+#elif defined(CONFIG_ARM64)
+
+// BUG: may break if perf is used
+#include <linux/perf/arm_pmuv3.h>
+
+static u64 armv8pmu_pmcr_read(void)
+{
+	return read_pmcr();
+}
+
+static void armv8pmu_pmcr_write(u64 val)
+{
+	val &= ARMV8_PMU_PMCR_MASK;
+	isb();
+	write_pmcr(val);
+}
+
+#define get_cycles_ordered() read_pmccntr()
+
+static u64 get_cycles_ordered_start(void)
+{
+	isb();
+	u64 mask = BIT(ARMV8_PMU_CYCLE_IDX);
+	write_pmcntenset(mask);
+	isb();
+	armv8pmu_pmcr_write(armv8pmu_pmcr_read() | ARMV8_PMU_PMCR_E);
+
+	return get_cycles_ordered();
+}
+
+#else
+// May use the timer on arm64.
+#define get_cycles_ordered() get_cycles()
+#define get_cycles_ordered_start() get_cycles()
+#endif
+
 static void bpf_test_timer_enter(struct bpf_test_timer *t)
 	__acquires(rcu)
 {
@@ -47,7 +86,7 @@ static void bpf_test_timer_enter(struct bpf_test_timer *t)
 	else
 		migrate_disable();
 
-	t->time_start = get_cycles_ordered();
+	t->time_start = get_cycles_ordered_start();
 }
 
 static void bpf_test_timer_leave(struct bpf_test_timer *t)
@@ -514,7 +553,7 @@ static int bpf_test_run_xdp(struct bpf_prog *prog, void *ctx, u32 repeat,
 	local_irq_save(flag);
 	old_ctx = bpf_set_run_ctx(&run_ctx.run_ctx);
 
-	start = get_cycles_ordered();
+	start = get_cycles_ordered_start();
 	for (i = 0; i < repeat; i++) {
 #ifdef CONFIG_BPFBOX_XDP_NOCOPY
 		memcpy(new_xdp, backup_xdp, sizeof(struct xdp_buff));
@@ -526,8 +565,7 @@ static int bpf_test_run_xdp(struct bpf_prog *prog, void *ctx, u32 repeat,
 		total += get_cycles_ordered() - start;
 		memcpy(ctx, xdp, sizeof(struct xdp_buff));
 		memcpy(((struct xdp_buff*)ctx)->data_hard_start, packet, PAGE_SIZE);
-		start = get_cycles_ordered();
-		/* bpf_test_timer_enter(&t); */
+		start = get_cycles_ordered_start();
 		run_ctx.prog_item = &item;
 		*retval = bpf_prog_run_xdp(prog, ctx);
 		/* bpf_test_timer_leave(&t); */
@@ -583,7 +621,7 @@ static int bpf_test_run_skb(struct bpf_prog *prog, void *ctx, u32 repeat,
 	start = get_cycles_ordered();
 	for (i = 0; i < repeat; i++) {
 #ifdef CONFIG_BPFBOX_XDP_NOCOPY
-		start = get_cycles_ordered();
+		start = get_cycles_ordered_start();
 		*retval = bpf_prog_run(prog, ctx);
 		total += get_cycles_ordered() - start;
 #else
