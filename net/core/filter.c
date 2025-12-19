@@ -239,8 +239,10 @@ BPF_CALL_4(bpf_skb_load_helper_8, const struct sk_buff *, skb, const void *,
 	const int len = sizeof(tmp);
 
 	if (offset >= 0) {
-		if (headlen - offset >= len)
+		if (headlen - offset >= len) {
+			offset = array_index_nospec(offset, headlen-len);
 			return *(u8 *)(data + offset);
+		}
 		if (!skb_copy_bits(skb, offset, &tmp, sizeof(tmp)))
 			return tmp;
 	} else {
@@ -295,8 +297,10 @@ BPF_CALL_4(bpf_skb_load_helper_16, const struct sk_buff *, skb, const void *,
 	const int len = sizeof(tmp);
 
 	if (offset >= 0) {
-		if (headlen - offset >= len)
+		if (headlen - offset >= len) {
+			offset = array_index_nospec(offset, headlen-len);
 			return get_unaligned_be16(data + offset);
+		}
 		if (!skb_copy_bits(skb, offset, &tmp, sizeof(tmp)))
 			return be16_to_cpu(tmp);
 	} else {
@@ -351,8 +355,10 @@ BPF_CALL_4(bpf_skb_load_helper_32, const struct sk_buff *, skb, const void *,
 	const int len = sizeof(tmp);
 
 	if (likely(offset >= 0)) {
-		if (headlen - offset >= len)
+		if (headlen - offset >= len) {
+			offset = array_index_nospec(offset, headlen-len);
 			return get_unaligned_be32(data + offset);
+		}
 		if (!skb_copy_bits(skb, offset, &tmp, sizeof(tmp)))
 			return be32_to_cpu(tmp);
 	} else {
