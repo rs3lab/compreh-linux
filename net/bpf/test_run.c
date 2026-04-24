@@ -587,6 +587,13 @@ static int bpf_test_run_xdp(struct bpf_prog *prog, void *ctx, u32 repeat,
 	return 0;
 }
 
+#ifdef CONFIG_SYNTHETIC_EXP
+int (*prepare_exp)(void *) = NULL;
+EXPORT_SYMBOL(prepare_exp);
+void *fake_packet = NULL;
+EXPORT_SYMBOL(fake_packet);
+#endif
+
 
 static int bpf_test_run_skb(struct bpf_prog *prog, void *ctx, u32 repeat,
 			u32 *retval, u32 *time)
@@ -597,6 +604,9 @@ static int bpf_test_run_skb(struct bpf_prog *prog, void *ctx, u32 repeat,
 	struct bpf_cg_run_ctx run_ctx;
 	/* struct bpf_test_timer t = { NO_MIGRATE }; */
 	enum bpf_cgroup_storage_type stype;
+#ifdef CONFIG_SYNTHETIC_EXP
+	void *old_packet = NULL;
+#endif
 	long start, total = 0;
 	unsigned long flag;
 	int i;
@@ -617,9 +627,21 @@ static int bpf_test_run_skb(struct bpf_prog *prog, void *ctx, u32 repeat,
 	if (!repeat)
 		repeat = 1;
 
+#ifdef CONFIG_SYNTHETIC_EXP
+	if (fake_packet) {
+		struct sk_buff *skb = ctx;
+
+		old_packet = skb->data;
+		skb->data = fake_packet;
+	}
+#endif
 	old_ctx = bpf_set_run_ctx(&run_ctx.run_ctx);
 	start = get_cycles_ordered();
 	for (i = 0; i < repeat; i++) {
+#ifdef CONFIG_SYNTHETIC_EXP
+		if (prepare_exp)
+			prepare_exp(ctx);
+#endif
 #ifdef CONFIG_BPFBOX_XDP_NOCOPY
 		start = get_cycles_ordered_start();
 		*retval = bpf_prog_run(prog, ctx);
@@ -631,6 +653,13 @@ static int bpf_test_run_skb(struct bpf_prog *prog, void *ctx, u32 repeat,
 	}
 	total += get_cycles_ordered() - start;
 	*time = total / repeat;
+#ifdef CONFIG_SYNTHETIC_EXP
+	if (old_packet) {
+		struct sk_buff *skb = ctx;
+
+		skb->data = old_packet;
+	}
+#endif
 	bpf_reset_run_ctx(old_ctx);
 	local_irq_restore(flag);
 	for_each_cgroup_storage_type(stype)
