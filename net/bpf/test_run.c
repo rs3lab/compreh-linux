@@ -386,6 +386,13 @@ static int bpf_test_run_xdp_live(struct bpf_prog *prog, struct xdp_buff *ctx,
 	return ret;
 }
 
+#ifdef CONFIG_SYNTHETIC_EXP
+int (*prepare_exp)(void *) = NULL;
+EXPORT_SYMBOL(prepare_exp);
+void *fake_packet = NULL;
+EXPORT_SYMBOL(fake_packet);
+#endif
+
 static int bpf_test_run(struct bpf_prog *prog, void *ctx, u32 repeat,
 			u32 *retval, u32 *time, bool xdp)
 {
@@ -395,6 +402,9 @@ static int bpf_test_run(struct bpf_prog *prog, void *ctx, u32 repeat,
 	struct bpf_cg_run_ctx run_ctx;
 	struct bpf_test_timer t = {};
 	enum bpf_cgroup_storage_type stype;
+#ifdef CONFIG_SYNTHETIC_EXP
+	void *old_packet = NULL;
+#endif
 	int ret;
 
 	for_each_cgroup_storage_type(stype) {
@@ -410,9 +420,21 @@ static int bpf_test_run(struct bpf_prog *prog, void *ctx, u32 repeat,
 	if (!repeat)
 		repeat = 1;
 
+#ifdef CONFIG_SYNTHETIC_EXP
+	if (fake_packet && !xdp) {
+		struct sk_buff *skb = ctx;
+
+		old_packet = skb->data;
+		skb->data = fake_packet;
+	}
+#endif
 	bpf_test_timer_enter(&t);
 	old_ctx = bpf_set_run_ctx(&run_ctx.run_ctx);
 	do {
+#ifdef CONFIG_SYNTHETIC_EXP
+		if (prepare_exp)
+			prepare_exp(ctx);
+#endif
 		run_ctx.prog_item = &item;
 		local_bh_disable();
 		bpf_net_ctx = bpf_net_ctx_set(&__bpf_net_ctx);
@@ -425,6 +447,13 @@ static int bpf_test_run(struct bpf_prog *prog, void *ctx, u32 repeat,
 		bpf_net_ctx_clear(bpf_net_ctx);
 		local_bh_enable();
 	} while (bpf_test_timer_continue(&t, 1, repeat, &ret, time));
+#ifdef CONFIG_SYNTHETIC_EXP
+	if (old_packet) {
+		struct sk_buff *skb = ctx;
+
+		skb->data = old_packet;
+	}
+#endif
 	bpf_reset_run_ctx(old_ctx);
 	bpf_test_timer_leave(&t);
 
