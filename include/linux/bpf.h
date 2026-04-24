@@ -2534,6 +2534,10 @@ bool bpf_jit_bypass_spec_v4(void);
 #ifdef CONFIG_BPF_SYSCALL
 DECLARE_PER_CPU(int, bpf_prog_active);
 extern struct mutex bpf_stats_enabled_mutex;
+extern int bpf_complexity_limit_jmp_seq;
+extern int bpf_spec_v1;
+extern int bpf_spec_v1_alu_san;
+extern int bpf_spec_v4;
 
 /*
  * Block execution of BPF programs attached to instrumentation (perf,
@@ -2740,6 +2744,11 @@ static inline bool bpf_allow_uninit_stack(const struct bpf_token *token)
 
 static inline bool bpf_bypass_spec_v1(const struct bpf_token *token)
 {
+	if (bpf_spec_v1 == 2)
+		return false;
+	if (bpf_spec_v1 == 0)
+		return true;
+
 	return bpf_jit_bypass_spec_v1() ||
 		cpu_mitigations_off() ||
 		bpf_token_capable(token, CAP_PERFMON);
@@ -2747,6 +2756,11 @@ static inline bool bpf_bypass_spec_v1(const struct bpf_token *token)
 
 static inline bool bpf_bypass_spec_v4(const struct bpf_token *token)
 {
+	if (bpf_spec_v4 == 2)
+		return false;
+	if (bpf_spec_v4 == 0)
+		return true;
+
 	return bpf_jit_bypass_spec_v4() ||
 		cpu_mitigations_off() ||
 		bpf_token_capable(token, CAP_PERFMON);

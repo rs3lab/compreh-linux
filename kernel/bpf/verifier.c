@@ -192,7 +192,6 @@ struct bpf_verifier_stack_elem {
 	u32 log_pos;
 };
 
-#define BPF_COMPLEXITY_LIMIT_JMP_SEQ	8192
 #define BPF_COMPLEXITY_LIMIT_STATES	64
 
 #define BPF_GLOBAL_PERCPU_MA_MAX_SIZE  512
@@ -1731,7 +1730,7 @@ static struct bpf_verifier_state *push_stack(struct bpf_verifier_env *env,
 	if (err)
 		return ERR_PTR(-ENOMEM);
 	elem->st.speculative |= speculative;
-	if (env->stack_size > BPF_COMPLEXITY_LIMIT_JMP_SEQ) {
+	if (env->stack_size > bpf_complexity_limit_jmp_seq) {
 		verbose(env, "The sequence of %d jumps is too complex.\n",
 			env->stack_size);
 		return ERR_PTR(-E2BIG);
@@ -2601,7 +2600,7 @@ static struct bpf_verifier_state *push_async_cb(struct bpf_verifier_env *env,
 	elem->log_pos = env->log.end_pos;
 	env->head = elem;
 	env->stack_size++;
-	if (env->stack_size > BPF_COMPLEXITY_LIMIT_JMP_SEQ) {
+	if (env->stack_size > bpf_complexity_limit_jmp_seq) {
 		verbose(env,
 			"The sequence of %d jumps is too complex for async cb.\n",
 			env->stack_size);
@@ -13448,6 +13447,8 @@ static int retrieve_ptr_limit(const struct bpf_reg_state *ptr_reg,
 static bool can_skip_alu_sanitation(const struct bpf_verifier_env *env,
 				    const struct bpf_insn *insn)
 {
+	if (bpf_spec_v1_alu_san == 0)
+		return true;
 	return env->bypass_spec_v1 ||
 		BPF_SRC(insn->code) == BPF_K ||
 		cur_aux(env)->nospec;
