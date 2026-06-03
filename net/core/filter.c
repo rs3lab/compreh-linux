@@ -1,17 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * cbpf-kstack-poc: Spectre-STL Prime+Probe PoC support.
- *
- * When a UDP socket carries SO_MARK == CBPF_POC_MAGIC, sk_filter_trim_cap()
- * redirects the cBPF filter's P[] view to a fixed-PA static buffer
- * (cbpf_pp_probe_buf) and plants a random oracle byte at P[0].
- * Userspace builds LLC eviction sets from the exported buffer PA, seeds M[0]
- * from P[0] inside the filter, triggers the Spectre-STL gadget, and uses
- * Prime+Probe to recover the oracle byte from the kernel stack.
- * /proc/cbpf_poc exposes the current oracle and buffer PA for verification.
- */
-
-/*
  * Linux Socket Filter - Kernel level socket filtering
  *
  * Based on the design of the Berkeley Packet Filter. The new
@@ -99,139 +87,27 @@
 
 #include "dev.h"
 
-/* =========================================================
- * cbpf-kstack Prime+Probe PoC support (see top-of-file comment)
- * =========================================================*/
+#ifdef CONFIG_CBPF_KSTACK_POC
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
-#include <asm/io.h>
+/* Defined here; declared extern in include/linux/bpf.h under the same guard.
+ * bpf_dispatcher_nop_func writes to this before every bpf_func call. */
+u8 cbpf_poc_m0_stale;
 
-#define CBPF_POC_MAGIC  0xcbf00000u
-
-/* cbpf P[] stride and slot count for the covert channel.
- * Slot 0 (offset 0) is the oracle slot; probe slots 0..255 start at offset 64.
- * Total buffer size = 257 × 64 = 16448 bytes.  Secret s touches cache line at
- * offset s*64 + 64 (probe slot s). */
-#define CBPF_PP_STRIDE  64u
-#define CBPF_PP_NSLOTS  256u
-#define CBPF_PP_SIZE    ((CBPF_PP_NSLOTS + 1u) * CBPF_PP_STRIDE)  /* 16448 */
-
-/* Stable-PA probe buffer.  P[] in the cBPF filter reads from here for any
- * socket with sk_mark == CBPF_POC_MAGIC.  Being a static global with nokaslr,
- * its physical address is fixed for the lifetime of the boot. */
-static char cbpf_pp_probe_buf[CBPF_PP_SIZE] __aligned(PAGE_SIZE);
-
-/* cbpf_poc_stale: byte at M[0]'s kernel stack address immediately before
- * the most-recent filter invocation.  After the first invocation the scrub
- * M[0]=0 commits, so stale becomes 0 on subsequent same-socket calls.
- *
- * cbpf_poc_stale_first: stale from the FIRST-EVER POC invocation after boot.
- * This is the genuine uninitialized kernel stack byte -- whatever function
- * last occupied cbpf_poc_run_direct's stack depth left there.  This is the
- * ground-truth value the exploit should recover; it is non-zero and stable.
- * Exposed via /proc/cbpf_poc as "stale_first" for verification. */
-static u8 cbpf_poc_stale;
-static u8 cbpf_poc_stale_first;
-static bool cbpf_poc_stale_first_set;
-
-static int cbpf_poc_proc_show(struct seq_file *m, void *v)
+static int cbpf_poc_show(struct seq_file *m, void *v)
 {
-	seq_printf(m,
-		   "pa=0x%llx stride=%u nslots=%u stale=0x%02x stale_first=0x%02x\n",
-		   (u64)virt_to_phys(cbpf_pp_probe_buf),
-		   CBPF_PP_STRIDE, CBPF_PP_NSLOTS,
-		   (unsigned int)cbpf_poc_stale,
-		   (unsigned int)cbpf_poc_stale_first);
+	seq_printf(m, "stale=0x%02x\n", (unsigned int)cbpf_poc_m0_stale);
 	return 0;
 }
 
-static int cbpf_poc_proc_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, cbpf_poc_proc_show, NULL);
-}
-
-/* mmap /proc/cbpf_poc to get shared access to cbpf_pp_probe_buf.
- * Enables Flush+Reload: userspace can clflush probe slots, trigger the
- * cBPF filter (which speculatively touches probe_buf[stale*64+64]), then
- * time each slot to find the warmed one without any cross-LLC P+P. */
-static int cbpf_poc_proc_mmap(struct file *file, struct vm_area_struct *vma)
-{
-	unsigned long size = vma->vm_end - vma->vm_start;
-
-	/* Accept any size up to the next page boundary above CBPF_PP_SIZE.
-	 * mmap() rounds up to PAGE_SIZE, so userspace naturally requests more. */
-	if (size > PAGE_ALIGN(CBPF_PP_SIZE))
-		return -EINVAL;
-	/* remap the probe buffer's physical pages to the requested vma. */
-	return remap_pfn_range(vma, vma->vm_start,
-			       virt_to_phys(cbpf_pp_probe_buf) >> PAGE_SHIFT,
-			       PAGE_ALIGN(CBPF_PP_SIZE), vma->vm_page_prot);
-}
-
-static const struct proc_ops cbpf_poc_proc_ops = {
-	.proc_open    = cbpf_poc_proc_open,
-	.proc_read    = seq_read,
-	.proc_lseek   = seq_lseek,
-	.proc_release = single_release,
-	.proc_mmap    = cbpf_poc_proc_mmap,
-};
-
-/*
- * cbpf_poc_run_direct - noinline shim that captures M[0]'s genuine kernel
- * stack value and then calls the JIT function directly (no inline wrappers).
- *
- * M[0] in the JIT (cBPF→eBPF, x86-64 JIT) lives at rbp_jit - 4.
- * Prologue: push rbp (-8) → mov rbp,rsp → sub rsp,64 → push callee-saved regs.
- * At the `call bpf_func` instruction in THIS function:
- *   CALL pushes retaddr: JIT entry rsp = our_rsp - 8
- *   push rbp: JIT rbp = our_rsp - 16
- *   M[0] = JIT rbp - 4 = our_rsp - 20
- *
- * Because this function has NO local variables and calls bpf_func DIRECTLY
- * (no intervening inline call chain), our_rsp is stable between the asm
- * and the call.  [rsp-20] is unambiguously M[0]'s address.
- *
- * We read that address WITHOUT writing -- capturing whatever the kernel left
- * there (a fragment of sk_filter_trim_cap()'s live stack: a local variable,
- * a saved register, or a pointer byte).  This is the secret the exploit
- * filter leaks via Spectre-STL.  Ground truth is exposed in /proc/cbpf_poc.
- */
-static noinline u32 cbpf_poc_run_direct(const struct bpf_prog *prog,
-					const void *ctx)
-{
-	unsigned int stale;
-
-	/* Read the byte that will be M[0] in the upcoming JIT call.
-	 * movzbl with a 32-bit output register avoids operand-size errors. */
-	asm volatile(
-		"movzbl -20(%%rsp), %0\n\t"
-		: "=r" (stale)
-		:
-		: "memory"
-	);
-	WRITE_ONCE(cbpf_poc_stale, (u8)stale);
-	if (!READ_ONCE(cbpf_poc_stale_first_set)) {
-		WRITE_ONCE(cbpf_poc_stale_first, (u8)stale);
-		WRITE_ONCE(cbpf_poc_stale_first_set, true);
-	}
-
-	/* Direct call -- rsp unchanged from asm to here, so [rsp-20] == M[0]. */
-	migrate_disable();
-	u32 ret = prog->bpf_func(ctx, prog->insnsi);
-	migrate_enable();
-	return ret;
-}
 static int __init cbpf_poc_init(void)
 {
-	/* Touch the probe buffer so pages are physically resident. */
-	memset(cbpf_pp_probe_buf, 0, CBPF_PP_SIZE);
-	if (!proc_create("cbpf_poc", 0444, NULL, &cbpf_poc_proc_ops))
+	if (!proc_create_single("cbpf_poc", 0444, NULL, cbpf_poc_show))
 		pr_warn("cbpf_poc: failed to create /proc/cbpf_poc\n");
-	pr_info("cbpf_poc: probe_buf PA=0x%llx size=%u\n",
-		(u64)virt_to_phys(cbpf_pp_probe_buf), CBPF_PP_SIZE);
 	return 0;
 }
 late_initcall(cbpf_poc_init);
+#endif /* CONFIG_CBPF_KSTACK_POC */
 
 /* Keep the struct bpf_fib_lookup small so that it fits into a cacheline */
 static_assert(sizeof(struct bpf_fib_lookup) == 64, "struct bpf_fib_lookup size check");
@@ -307,45 +183,7 @@ sk_filter_trim_cap(struct sock *sk, struct sk_buff *skb, unsigned int cap)
 		unsigned int pkt_len;
 
 		skb->sk = sk;
-
-		/* cbpf-kstack PoC: for CBPF_POC_MAGIC sockets redirect P[] to the
-		 * fixed-PA probe buffer and run the filter via cbpf_poc_run_direct
-		 * which plants the oracle at M[0]'s exact kernel stack address.
-		 *
-		 * The cBPF exploit filter does NOT seed M[0] from P[].  It just
-		 * does: pressure stores → scrub M[0]=0 → speculative reload of
-		 * M[0] (SSB bypasses the pending scrub) → encode stale byte as
-		 * P[stale*64 + 64].  The stale value is the oracle planted by
-		 * cbpf_poc_run_direct -- a kernel-generated random byte, unknown
-		 * to userspace until it reads /proc/cbpf_poc after the trial. */
-		unsigned char *poc_orig_data     = NULL;
-		unsigned int   poc_orig_len      = 0;
-		unsigned int   poc_orig_data_len = 0;
-		if (sk->sk_mark == CBPF_POC_MAGIC && bpf_prog_was_classic(filter->prog)) {
-			/* Do NOT copy skb data into probe_buf -- that would touch all
-			 * 256 cache lines before the filter runs, destroying the F+R
-			 * covert channel.  probe_buf is already valid (zero-initialized
-			 * at boot); we just redirect P[] to it so the filter's
-			 * speculative access lands on exactly one probe cache line. */
-			poc_orig_data     = skb->data;
-			poc_orig_len      = skb->len;
-			poc_orig_data_len = skb->data_len;
-			skb->data     = (unsigned char *)cbpf_pp_probe_buf;
-			skb->len      = CBPF_PP_SIZE;
-			skb->data_len = 0;
-			/* Run filter directly so the asm in cbpf_poc_run_direct
-			 * has an unambiguous [rsp-20] == M[0] relationship. */
-			pkt_len = cbpf_poc_run_direct(filter->prog, skb);
-		} else {
-			pkt_len = bpf_prog_run_save_cb(filter->prog, skb);
-		}
-
-		if (poc_orig_data) {
-			skb->data     = poc_orig_data;
-			skb->len      = poc_orig_len;
-			skb->data_len = poc_orig_data_len;
-		}
-
+		pkt_len = bpf_prog_run_save_cb(filter->prog, skb);
 		skb->sk = save_sk;
 		err = pkt_len ? pskb_trim(skb, max(cap, pkt_len)) : -EPERM;
 		if (err)
