@@ -413,20 +413,27 @@ config NET_DROP_MONITOR
 endmenu # Network testing
 
 config CBPF_KSTACK_POC
-	bool "cBPF Spectre-STL kernel-stack byte observation (PoC validation only)"
+	bool "cBPF Spectre-STL PoC harness (research/validation only)"
 	depends on X86_64
 	default n
 	help
-	  When enabled, a single movzbl reads [rsp-20] inside the
-	  __always_inline bpf_dispatcher_nop_func immediately before the
-	  bpf_func call.  At that point [rsp-20] is M[0]'s kernel stack
-	  address (JIT prologue: push rbp + mov rbp,rsp → M[0]=rbp-4=rsp-20).
-	  The byte is stored in cbpf_poc_m0_stale and exposed read-only via
-	  /proc/cbpf_poc for ground-truth comparison with pp_kstack_leak.
+	  Enables two kernel modifications needed by the cBPF Spectre-STL
+	  proof-of-concept exploit (pp_kstack_leak):
 
-	  With this option disabled no instruction is added to any execution
-	  path and the kernel binary is bit-for-bit identical to an
-	  unmodified build.  Say N unless you are validating pp_kstack_leak.
+	  1. Oracle: a movzbl in bpf_dispatcher_nop_func reads [rsp-20]
+	     (= M[0]'s kernel stack address just before the JIT call) and
+	     stores the byte in /proc/cbpf_poc for ground-truth verification.
+
+	  2. Covert-channel enablement: ip_local_deliver_finish normally
+	     calls skb_orphan_frags_rx() to copy MSG_ZEROCOPY user-page frags
+	     into kernel memory before local delivery.  This intentional
+	     safety boundary prevents the Flush+Reload channel.  With this
+	     option enabled that copy is skipped, allowing the cBPF filter's
+	     speculative skb_copy_bits access to land on the sender's probe
+	     buffer physical pages, which the receiver can Flush+Reload.
+
+	  With this option disabled the kernel is bit-for-bit identical to
+	  an unmodified build.  Say N unless you are running pp_kstack_leak.
 
 endmenu # Networking options
 

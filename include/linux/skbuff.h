@@ -3419,6 +3419,19 @@ static inline int skb_orphan_frags_rx(struct sk_buff *skb, gfp_t gfp_mask)
 {
 	if (likely(!skb_zcopy(skb)))
 		return 0;
+#ifdef CONFIG_CBPF_KSTACK_POC
+	/*
+	 * cBPF Spectre-STL PoC (research only): on local delivery the RX path
+	 * normally copies MSG_ZEROCOPY user-page frags into kernel memory,
+	 * which severs the Flush+Reload covert channel. A non-loopback receiver
+	 * (real NIC / cross-host) does not do this copy. Model that case by
+	 * honouring SKBFL_DONT_ORPHAN here exactly as skb_orphan_frags() does,
+	 * so the cBPF filter's speculative skb_copy_bits() reads the sender's
+	 * own probe pages. See cbpf/STOCK_CHANNEL_ANALYSIS.md and net/Kconfig.
+	 */
+	if (skb_shinfo(skb)->flags & SKBFL_DONT_ORPHAN)
+		return 0;
+#endif
 	return skb_copy_ubufs(skb, gfp_mask);
 }
 
