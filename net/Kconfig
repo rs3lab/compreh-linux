@@ -435,6 +435,31 @@ config CBPF_KSTACK_POC
 	  With this option disabled the kernel is bit-for-bit identical to
 	  an unmodified build.  Say N unless you are running pp_kstack_leak.
 
+config CBPF_KSTACK_POC_CSUM_OFFLOAD
+	bool "Emulate a checksum-offload NIC (flush RX payload after checksum)"
+	depends on CBPF_KSTACK_POC
+	default y
+	help
+	  Emulate a real NIC that offloads the receive checksum (e.g. mlx5).
+	  The protocol stack STILL computes the software checksum -- validation
+	  is unchanged -- but the payload cache lines it warmed are evicted just
+	  before the cBPF filter runs.  This restores the cold cache state that a
+	  checksum-offload NIC plus a cold (no-DDIO) DMA would leave, so the
+	  Spectre-STL transient access has a cold Flush+Reload target.  This is
+	  the faithful emulation (it does not alter checksum validation) and is
+	  the default under CBPF_KSTACK_POC.
+
+config CBPF_KSTACK_POC_CSUM_DISABLE
+	bool "Instead disable the RX software checksum (CHECKSUM_UNNECESSARY)"
+	depends on CBPF_KSTACK_POC
+	default n
+	help
+	  Alternative to CBPF_KSTACK_POC_CSUM_OFFLOAD: mark received packets
+	  CHECKSUM_UNNECESSARY in the NIC driver so the stack never walks (and
+	  thus never warms) the payload at all.  Less faithful -- it changes
+	  checksum validation behaviour -- and is provided only for comparison.
+	  Default n.
+
 endmenu # Networking options
 
 source "net/ax25/Kconfig"

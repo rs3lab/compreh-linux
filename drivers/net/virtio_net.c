@@ -28,6 +28,37 @@
 #include <net/xdp_sock_drv.h>
 #include <net/page_pool/helpers.h>
 
+#ifdef CONFIG_CBPF_KSTACK_POC
+#include <asm/cacheflush.h>
+/* Emulate a cold NIC DMA (real no-DDIO hardware lands RX payload in DRAM, not
+ * cache). QEMU's emulated virtio RX warms the payload via host-side stores,
+ * which masks the cBPF Spectre-STL transient F+R signal. Evicting the received
+ * payload here, before it goes up the stack, models the coldness the
+ * receive-side (TCP_ZEROCOPY_RECEIVE) channel depends on. PoC only;
+ * CONFIG_CBPF_KSTACK_POC=n leaves the driver bit-for-bit vanilla. */
+static inline void cbpf_poc_flush_rx(struct sk_buff *skb)
+{
+	int i;
+
+#ifdef CONFIG_CBPF_KSTACK_POC_CSUM_DISABLE
+	/* Alternative csum emulation: mark verified so the stack never walks (and
+	 * thus never warms) the payload. Changes validation behaviour; non-default.
+	 * The faithful default (CBPF_KSTACK_POC_CSUM_OFFLOAD) instead lets the
+	 * checksum run and evicts the payload after it, before the filter. */
+	skb->ip_summed = CHECKSUM_UNNECESSARY;
+#endif
+	/* Cold-DMA emulation: evict the just-received payload so it is uncached,
+	 * as a real no-DDIO NIC DMA to DRAM would leave it (QEMU's emulated RX
+	 * warms it via host stores). */
+	clflush_cache_range(skb->data, skb_headlen(skb));
+	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+		const skb_frag_t *f = &skb_shinfo(skb)->frags[i];
+
+		clflush_cache_range(skb_frag_address(f), skb_frag_size(f));
+	}
+}
+#endif
+
 static int napi_weight = NAPI_POLL_WEIGHT;
 module_param(napi_weight, int, 0444);
 
@@ -2527,6 +2558,9 @@ static void virtnet_receive_done(struct virtnet_info *vi, struct receive_queue *
 	pr_debug("Receiving skb proto 0x%04x len %i type %i\n",
 		 ntohs(skb->protocol), skb->len, skb->pkt_type);
 
+#ifdef CONFIG_CBPF_KSTACK_POC
+	cbpf_poc_flush_rx(skb);
+#endif
 	napi_gro_receive(&rq->napi, skb);
 	return;
 

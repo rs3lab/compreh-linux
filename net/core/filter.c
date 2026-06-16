@@ -150,6 +150,27 @@ static noinline void cbpf_poc_probe_coldness(struct sk_buff *skb)
 	if (lf > cpoc_first_max) cpoc_first_max = lf;
 }
 
+#ifdef CONFIG_CBPF_KSTACK_POC_CSUM_OFFLOAD
+#include <asm/cacheflush.h>
+/* Emulate a checksum-offload NIC: the stack has already computed the software
+ * checksum (validation unchanged), but a real offload NIC would not have warmed
+ * the payload doing so. Evict the payload here, right before the filter runs, to
+ * restore that cold state -- giving the Spectre-STL transient access a cold F+R
+ * target. (Combined with the virtio cold-DMA flush, this models cold DMA + csum
+ * offload.) */
+static void cbpf_poc_flush_payload(struct sk_buff *skb)
+{
+	int i;
+
+	clflush_cache_range(skb->data, skb_headlen(skb));
+	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+		const skb_frag_t *f = &skb_shinfo(skb)->frags[i];
+
+		clflush_cache_range(skb_frag_address(f), skb_frag_size(f));
+	}
+}
+#endif
+
 static int cbpf_poc_show(struct seq_file *m, void *v)
 {
 	u64 n = cpoc_n ? cpoc_n : 1;
@@ -247,8 +268,11 @@ sk_filter_trim_cap(struct sock *sk, struct sk_buff *skb, unsigned int cap)
 		unsigned int pkt_len;
 
 		skb->sk = sk;
+#ifdef CONFIG_CBPF_KSTACK_POC_CSUM_OFFLOAD
+		cbpf_poc_flush_payload(skb);	/* csum-offload emulation: cold before filter */
+#endif
 #ifdef CONFIG_CBPF_KSTACK_POC
-		cbpf_poc_probe_coldness(skb);
+		cbpf_poc_probe_coldness(skb);	/* verify: lat_first should now be cold */
 #endif
 		pkt_len = bpf_prog_run_save_cb(filter->prog, skb);
 		skb->sk = save_sk;
