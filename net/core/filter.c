@@ -90,13 +90,77 @@
 #ifdef CONFIG_CBPF_KSTACK_POC
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <asm/msr.h>
 /* Defined here; declared extern in include/linux/bpf.h under the same guard.
  * bpf_dispatcher_nop_func writes to this before every bpf_func call. */
 u8 cbpf_poc_m0_stale;
 
+/* Coldness probe: for each filtered skb, time the first access to the payload
+ * byte at filter-run time (the "cold?" question), plus a warm reference (second
+ * access) and a flushed reference (clflush then access) measured in the same
+ * window so userspace can classify without an external calibration. If the
+ * first-access latency tracks the flushed reference, the RX path left the
+ * payload uncached at filter time -> the transient F+R channel is observable;
+ * if it tracks the warm reference, virtio/DMA warmed it and the channel is
+ * masked. nr_frags is reported because only frag pages are TCP_ZEROCOPY_RECEIVE
+ * mappable (linear head is kernel slab, not userspace-observable). */
+static u64 cpoc_n, cpoc_nfrag;
+static u64 cpoc_first_sum, cpoc_warm_sum, cpoc_flush_sum;
+static u64 cpoc_first_min = ~0ULL, cpoc_first_max;
+
+static noinline void cbpf_poc_probe_coldness(struct sk_buff *skb)
+{
+	const volatile u8 *p;
+	unsigned long flags;
+	u64 t0, lf, lw, lc;
+	u8 sink;
+
+	/* Probe a deep PAYLOAD byte, not the header: eth_type_trans/IP/UDP read
+	 * the first ~42 bytes regardless, so a header byte is always warm and says
+	 * nothing about whether the payload (where the filter's secret-dependent
+	 * access lands) is cached. Only a software checksum walk touches the deep
+	 * payload. */
+	if (skb_shinfo(skb)->nr_frags > 0) {
+		const skb_frag_t *f = &skb_shinfo(skb)->frags[0];
+		struct page *pg = skb_frag_page(f);
+
+		if (!pg || skb_frag_size(f) < 64)
+			return;
+		p = (const volatile u8 *)page_address(pg) + skb_frag_off(f);
+		cpoc_nfrag++;
+	} else {
+		if (skb->len < 512)
+			return;
+		p = (const volatile u8 *)skb->data + 256;
+	}
+	if (!virt_addr_valid((const void *)p))
+		return;
+
+	local_irq_save(flags);
+	t0 = rdtsc_ordered(); sink = *p;            lf = rdtsc_ordered() - t0;
+	t0 = rdtsc_ordered(); sink = *p;            lw = rdtsc_ordered() - t0;
+	asm volatile("clflush %0" :: "m"(*p) : "memory"); mb();
+	t0 = rdtsc_ordered(); sink = *p;            lc = rdtsc_ordered() - t0;
+	local_irq_restore(flags);
+	(void)sink;
+
+	cpoc_n++;
+	cpoc_first_sum += lf; cpoc_warm_sum += lw; cpoc_flush_sum += lc;
+	if (lf < cpoc_first_min) cpoc_first_min = lf;
+	if (lf > cpoc_first_max) cpoc_first_max = lf;
+}
+
 static int cbpf_poc_show(struct seq_file *m, void *v)
 {
+	u64 n = cpoc_n ? cpoc_n : 1;
+
 	seq_printf(m, "stale=0x%02x\n", (unsigned int)cbpf_poc_m0_stale);
+	seq_printf(m, "coldprobe n=%llu nfrag=%llu\n", cpoc_n, cpoc_nfrag);
+	seq_printf(m, "lat_first_avg=%llu lat_first_min=%llu lat_first_max=%llu\n",
+		   cpoc_first_sum / n,
+		   cpoc_first_min == ~0ULL ? 0 : cpoc_first_min, cpoc_first_max);
+	seq_printf(m, "lat_warm_avg=%llu lat_flushed_avg=%llu\n",
+		   cpoc_warm_sum / n, cpoc_flush_sum / n);
 	return 0;
 }
 
@@ -183,6 +247,9 @@ sk_filter_trim_cap(struct sock *sk, struct sk_buff *skb, unsigned int cap)
 		unsigned int pkt_len;
 
 		skb->sk = sk;
+#ifdef CONFIG_CBPF_KSTACK_POC
+		cbpf_poc_probe_coldness(skb);
+#endif
 		pkt_len = bpf_prog_run_save_cb(filter->prog, skb);
 		skb->sk = save_sk;
 		err = pkt_len ? pskb_trim(skb, max(cap, pkt_len)) : -EPERM;
