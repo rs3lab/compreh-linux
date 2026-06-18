@@ -5490,11 +5490,64 @@ end:
 		tcp_rcvbuf_grow(sk, tp->rcvq_space.space);
 }
 
+#ifdef CONFIG_CBPF_KSTACK_POC_HDS_EMUL
+#include <linux/skbuff_ref.h>
+/*
+ * Reconstruct any PAGE_SIZE frag that fails can_map_frag() (non-zero offset,
+ * compound page, or page->mapping set) onto a fresh non-compound order-0 page
+ * at offset 0, so tcp_zerocopy_receive() can vm_insert_page() it.
+ *
+ * Sub-PAGE_SIZE frags are left untouched: padding them to PAGE_SIZE would
+ * inflate skb->len past the TCP sequence range and corrupt copied_seq.
+ */
+static void cbpf_poc_hds_emul_skb(struct sk_buff *skb)
+{
+	struct skb_shared_info *shinfo = skb_shinfo(skb);
+	int i;
+
+	for (i = 0; i < shinfo->nr_frags; i++) {
+		skb_frag_t *f = &shinfo->frags[i];
+		struct page *old_page, *new_page;
+		unsigned int off;
+
+		if (skb_frag_size(f) != PAGE_SIZE)
+			continue;
+
+		off      = skb_frag_off(f);
+		old_page = skb_frag_page(f);
+
+		if (!off && !PageCompound(old_page) && !old_page->mapping)
+			continue; /* already passes can_map_frag */
+
+		new_page = alloc_page(GFP_ATOMIC);
+		if (!new_page)
+			return;
+
+		/*
+		 * For a PAGE_SIZE frag at non-zero offset the backing page must
+		 * be compound (order >= 1, i.e. >= 2*PAGE_SIZE), so reading
+		 * PAGE_SIZE bytes from page_address(old_page)+off is safe.
+		 */
+		memcpy(page_address(new_page),
+		       page_address(old_page) + off,
+		       PAGE_SIZE);
+
+		skb_frag_unref(skb, i);
+		/* Replace frag in-place: same size, new page at offset 0. */
+		skb_frag_fill_page_desc(f, new_page, 0, PAGE_SIZE);
+	}
+}
+#endif /* CONFIG_CBPF_KSTACK_POC_HDS_EMUL */
+
 static int __must_check tcp_queue_rcv(struct sock *sk, struct sk_buff *skb,
 				      bool *fragstolen)
 {
 	int eaten;
 	struct sk_buff *tail = skb_peek_tail(&sk->sk_receive_queue);
+
+#ifdef CONFIG_CBPF_KSTACK_POC_HDS_EMUL
+	cbpf_poc_hds_emul_skb(skb);
+#endif
 
 	eaten = (tail &&
 		 tcp_try_coalesce(sk, tail,

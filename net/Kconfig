@@ -460,6 +460,42 @@ config CBPF_KSTACK_POC_CSUM_DISABLE
 	  checksum validation behaviour -- and is provided only for comparison.
 	  Default n.
 
+config CBPF_KSTACK_POC_HDS_EMUL
+	bool "Emulate a header-split NIC: rewrite RX frags to PAGE_SIZE @ offset 0"
+	depends on CBPF_KSTACK_POC
+	default n
+	help
+	  On real hardware TCP_ZEROCOPY_RECEIVE requires an HDS NIC (e.g. mlx5
+	  ConnectX-6 Dx+) that delivers TCP payload in exactly one full PAGE_SIZE
+	  frag per segment at page offset 0, satisfying can_map_frag().  QEMU
+	  virtio-net does not produce such frags.
+
+	  With this option, just before each in-order skb enters sk_receive_queue,
+	  any frag that is exactly PAGE_SIZE but fails can_map_frag() (non-zero
+	  offset, compound page, or page->mapping set) is copied to a fresh
+	  non-compound order-0 kernel page at offset 0.  Sub-PAGE_SIZE frags are
+	  left untouched (they won't map, and copying them would inflate skb->len
+	  beyond the TCP sequence range, corrupting copied_seq accounting).
+
+	  For frags to be PAGE_SIZE in the first place the sender must use
+	  MSG_ZEROCOPY with a page-aligned, page-multiple buffer and the receiver
+	  must advertise MSS = PAGE_SIZE + 12 (TCP timestamp overhead), so that
+	  each segment carries exactly one page of payload.  This is exactly what
+	  cbpf/zc_send.c and cbpf/zc_recv.c are set up to do.
+
+	  When this option is enabled the CBPF_KSTACK_POC orphan relaxation in
+	  skb_orphan_frags_rx() is automatically suppressed: skb_copy_ubufs()
+	  runs on MSG_ZEROCOPY loopback frags, replacing sender user-pages with
+	  fresh kernel pages (page->mapping == NULL).  This is required for
+	  can_map_frag() to pass.  Send-side tests (pp_kstack_leak.c) are
+	  unaffected (UDP, no MSG_ZEROCOPY frags).
+
+	  A one-time diagnostic (first 8 skbs) is printed via pr_info under
+	  "cbpf_hds_diag:" so the actual frag layout seen by tcp_zerocopy_receive
+	  can be checked in dmesg after the first TCP_ZEROCOPY_RECEIVE call.
+
+	  Say N for production kernels.
+
 endmenu # Networking options
 
 source "net/ax25/Kconfig"

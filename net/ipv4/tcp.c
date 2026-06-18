@@ -2279,6 +2279,27 @@ static int tcp_zerocopy_receive(struct sock *sk,
 			}
 			zc->recv_skip_hint = skb->len - offset;
 			frags = skb_advance_to_frag(skb, offset, &offset_frag);
+#ifdef CONFIG_CBPF_KSTACK_POC_HDS_EMUL
+			/* One-time layout dump: tells us which can_map_frag() leg fails */
+			{
+				static atomic_t _n = ATOMIC_INIT(0);
+				if (atomic_fetch_add(1, &_n) < 8) {
+					int _i;
+					pr_info("cbpf_hds_diag: headlen=%u nr_frags=%d frags=%s off_frag=%u\n",
+						skb_headlen(skb),
+						skb_shinfo(skb)->nr_frags,
+						frags ? "ok" : "NULL",
+						frags ? offset_frag : 0u);
+					for (_i = 0; _i < skb_shinfo(skb)->nr_frags; _i++) {
+						const skb_frag_t *_f = &skb_shinfo(skb)->frags[_i];
+						struct page *_p = skb_frag_page(_f);
+						pr_info("cbpf_hds_diag:  [%d] off=%u sz=%u comp=%d map=%d\n",
+							_i, skb_frag_off(_f), skb_frag_size(_f),
+							PageCompound(_p), !!_p->mapping);
+					}
+				}
+			}
+#endif
 			if (!frags || offset_frag)
 				break;
 		}

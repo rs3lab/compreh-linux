@@ -1400,24 +1400,33 @@ static __always_inline __bpfcall unsigned int bpf_dispatcher_nop_func(
 	bpf_func_t bpf_func)
 {
 #ifdef CONFIG_CBPF_KSTACK_POC
-	/* Read M[0]'s kernel-stack byte before the JIT call fires.
-	 *
-	 * This function is __always_inline with no locals.  The compiler
-	 * lowers `return bpf_func(ctx, insnsi)` to a single indirect call
-	 * instruction; our asm executes immediately before it with rsp
-	 * unchanged.  With the cBPF→eBPF x86-64 JIT prologue
+	/* M[0] offset derivation (cBPF→eBPF x86-64 JIT prologue):
 	 *   push rbp  (-8)
-	 *   mov  rbp, rsp        → rbp = rsp_at_call - 8 (after retaddr -8)
-	 *   sub  rsp, 64         → M[0] = rbp - 4 = rsp_at_call - 20
-	 * the address [rsp-20] is unambiguously M[0].  The read is
-	 * non-destructive: rsp is not modified before the call.
-	 */
+	 *   mov  rbp, rsp        → rbp = rsp_at_call - 8
+	 *   sub  rsp, 64         → M[0] = [rbp - 4] = [rsp_at_call - 20]
+	 * This function is __always_inline with no locals, so rsp is unchanged
+	 * at the point of the asm relative to the enclosing call site. */
+#ifdef CONFIG_CBPF_KSTACK_POC_HDS_EMUL
+	/* Inject a fixed stale value (0xAA) into the M[0] slot for controlled
+	 * SSBD comparison experiments.  0xAA has four set bits spread across
+	 * the byte, giving four independent bit-channels to test.  The store
+	 * is architectural; the JIT'd filter then stores 0 to the same slot and
+	 * speculatively loads the stale 0xAA via SSB. */
+	{
+		extern u8 cbpf_poc_m0_stale;
+		asm volatile("movb $0xAA,-20(%%rsp)" ::: "memory");
+		WRITE_ONCE(cbpf_poc_m0_stale, 0xAA);
+	}
+#else
+	/* Read the natural kernel-stack residue in M[0] for real (non-emulated)
+	 * experiments where the stale comes from the live kernel call path. */
 	{
 		extern u8 cbpf_poc_m0_stale;
 		unsigned int _s;
 		asm volatile("movzbl -20(%%rsp),%0" : "=r"(_s) :: "memory");
 		WRITE_ONCE(cbpf_poc_m0_stale, (u8)_s);
 	}
+#endif
 #endif
 	return bpf_func(ctx, insnsi);
 }
