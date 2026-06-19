@@ -94,6 +94,7 @@
 /* Defined here; declared extern in include/linux/bpf.h under the same guard.
  * bpf_dispatcher_nop_func writes to this before every bpf_func call. */
 u8 cbpf_poc_m0_stale;
+EXPORT_SYMBOL_GPL(cbpf_poc_m0_stale);
 u8 cbpf_poc_slot;
 
 static int cbpf_poc_show(struct seq_file *m, void *v)
