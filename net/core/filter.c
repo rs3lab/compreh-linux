@@ -90,6 +90,7 @@
 #ifdef CONFIG_CBPF_KSTACK_POC
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/smp.h>
 #include <asm/msr.h>
 /* Defined here; declared extern in include/linux/bpf.h under the same guard.
  * bpf_dispatcher_nop_func writes to this before every bpf_func call. */
@@ -126,6 +127,38 @@ u8 cbpf_poc_m0_stale;
 #define CBPF_POC_BUF_MINLEN (10u * 4096u)  /* only arm buf channel for big skbs  */
 
 static u8 cbpf_poc_buf[CBPF_POC_BUF_SIZE] __aligned(4096);
+
+static u64 cpoc_filter_n, cpoc_filter_migrations;
+static u64 cpoc_filter_pre_mask, cpoc_filter_post_mask;
+static int cpoc_filter_pre_last = -1, cpoc_filter_post_last = -1;
+
+static void cbpf_poc_cpu_mask_set(u64 *mask, unsigned int cpu)
+{
+	if (cpu < 64)
+		*mask |= 1ULL << cpu;
+}
+
+static unsigned int cbpf_poc_filter_cpu_pre(void)
+{
+	unsigned int cpu = get_cpu();
+
+	cpoc_filter_n++;
+	cpoc_filter_pre_last = cpu;
+	cbpf_poc_cpu_mask_set(&cpoc_filter_pre_mask, cpu);
+	put_cpu();
+	return cpu;
+}
+
+static void cbpf_poc_filter_cpu_post(unsigned int pre_cpu)
+{
+	unsigned int cpu = get_cpu();
+
+	cpoc_filter_post_last = cpu;
+	cbpf_poc_cpu_mask_set(&cpoc_filter_post_mask, cpu);
+	if (cpu != pre_cpu)
+		cpoc_filter_migrations++;
+	put_cpu();
+}
 
 /* Coldness probe: for each filtered skb, time the first access to the payload
  * byte at filter-run time (the "cold?" question), plus a warm reference (second
@@ -308,6 +341,10 @@ static int cbpf_poc_show(struct seq_file *m, void *v)
 	u64 bn = cbuf_n ? cbuf_n : 1;
 
 	seq_printf(m, "stale=0x%02x\n", (unsigned int)cbpf_poc_m0_stale);
+	seq_printf(m,
+		   "filter_cpu n=%llu pre_last=%d post_last=%d pre_mask=0x%016llx post_mask=0x%016llx migrations=%llu\n",
+		   cpoc_filter_n, cpoc_filter_pre_last, cpoc_filter_post_last,
+		   cpoc_filter_pre_mask, cpoc_filter_post_mask, cpoc_filter_migrations);
 	seq_printf(m, "coldprobe n=%llu nfrag=%llu\n", cpoc_n, cpoc_nfrag);
 	seq_printf(m, "lat_first_avg=%llu lat_first_min=%llu lat_first_max=%llu\n",
 		   cpoc_first_sum / n,
@@ -411,6 +448,9 @@ sk_filter_trim_cap(struct sock *sk, struct sk_buff *skb, unsigned int cap)
 	if (filter) {
 		struct sock *save_sk = skb->sk;
 		unsigned int pkt_len;
+#ifdef CONFIG_CBPF_KSTACK_POC
+		unsigned int cpoc_filter_pre_cpu = (unsigned int)-1;
+#endif
 
 		skb->sk = sk;
 #ifdef CONFIG_CBPF_KSTACK_POC_CSUM_OFFLOAD
@@ -420,9 +460,11 @@ sk_filter_trim_cap(struct sock *sk, struct sk_buff *skb, unsigned int cap)
 		cbpf_poc_probe_coldness(skb);	/* verify: lat_first should now be cold */
 		if (skb->len >= CBPF_POC_BUF_MINLEN)
 			cbpf_poc_flush_buf();	/* custom buffer cold before the filter */
+		cpoc_filter_pre_cpu = cbpf_poc_filter_cpu_pre();
 #endif
 		pkt_len = bpf_prog_run_save_cb(filter->prog, skb);
 #ifdef CONFIG_CBPF_KSTACK_POC
+		cbpf_poc_filter_cpu_post(cpoc_filter_pre_cpu);
 		cbpf_poc_probe_signal(skb);	/* time frags while SIG line still L1-hot */
 		if (skb->len >= CBPF_POC_BUF_MINLEN)
 			cbpf_poc_probe_buf();	/* time custom buffer (shallow-path channel) */
