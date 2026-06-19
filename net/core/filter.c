@@ -105,6 +105,28 @@ u8 cbpf_poc_m0_stale;
 #define CPOC_SIG_FRAG   9
 #define CPOC_COLD_FRAG  5
 
+/* Custom "direct" side-channel buffer (cbpf/zc_kstack_leak.c `ktimebuf` mode).
+ *
+ * The frag channel is fundamentally slow: a secret-dependent cBPF P[X] reaches a
+ * frag only through bpf_skb_load_helper_8 -> skb_copy_bits -> memcpy, far too
+ * deep for cBPF's narrow SSB window (~1e-7 landings, see EXPERIMENT_LOG §8b).
+ * Here we give cBPF a fixed buffer it can reach via a SHALLOW fast path: a P[X]
+ * whose offset is >= CBPF_POC_BUF_BASE is served by a single direct array deref
+ * at the top of bpf_skb_load_helper_8 (one call, no skb_copy_bits), modelling
+ * the linear-head fast-path load that is the common case for real cBPF filters.
+ * The buffer is a fixed, page-aligned kernel allocation, so its physical lines
+ * are stable across packets -- the cleanest possible Flush+Reload target, timed
+ * in-kernel right after the filter. */
+#define CBPF_POC_BUF_PAGES  16u
+#define CBPF_POC_BUF_SIZE   (CBPF_POC_BUF_PAGES * 4096u)
+#define CBPF_POC_BUF_BASE   0x10000000  /* P[X] offset >= this -> custom buffer  */
+#define CBUF_ARCH_PAGE      0u          /* M[0]=0 architectural deref            */
+#define CBUF_SIG_PAGE       8u          /* speculative (SSB) deref, stale bit=1  */
+#define CBUF_COLD_PAGE      4u          /* never addressed; noise floor          */
+#define CBPF_POC_BUF_MINLEN (10u * 4096u)  /* only arm buf channel for big skbs  */
+
+static u8 cbpf_poc_buf[CBPF_POC_BUF_SIZE] __aligned(4096);
+
 /* Coldness probe: for each filtered skb, time the first access to the payload
  * byte at filter-run time (the "cold?" question), plus a warm reference (second
  * access) and a flushed reference (clflush then access) measured in the same
@@ -240,10 +262,50 @@ static noinline void cbpf_poc_probe_signal(struct sk_buff *skb)
 	if (ls <  lc)  csig_lt_cold++;		/* threshold-free SIG-faster-than-COLD */
 }
 
+/* Custom-buffer side channel: flush the three probed lines cold before the
+ * filter, time them right after.  The buffer is fixed, so unlike the frag
+ * channel these are the same physical lines every packet. */
+static u64 cbuf_n, cbuf_warm, cbuf_arch_warm, cbuf_cold_warm, cbuf_lt_cold;
+static u64 cbuf_sig_sum, cbuf_arch_sum, cbuf_cold_sum;
+
+static void cbpf_poc_flush_buf(void)
+{
+	asm volatile("clflush %0" :: "m"(cbpf_poc_buf[CBUF_ARCH_PAGE * 4096 + CPOC_HDR]) : "memory");
+	asm volatile("clflush %0" :: "m"(cbpf_poc_buf[CBUF_SIG_PAGE  * 4096 + CPOC_HDR]) : "memory");
+	asm volatile("clflush %0" :: "m"(cbpf_poc_buf[CBUF_COLD_PAGE * 4096 + CPOC_HDR]) : "memory");
+	mb();
+}
+
+static noinline void cbpf_poc_probe_buf(void)
+{
+	const volatile u8 *pa = &cbpf_poc_buf[CBUF_ARCH_PAGE * 4096 + CPOC_HDR];
+	const volatile u8 *ps = &cbpf_poc_buf[CBUF_SIG_PAGE  * 4096 + CPOC_HDR];
+	const volatile u8 *pc = &cbpf_poc_buf[CBUF_COLD_PAGE * 4096 + CPOC_HDR];
+	unsigned long flags;
+	u64 t0, la, ls, lc, thr;
+	u8 sink;
+
+	local_irq_save(flags);
+	t0 = rdtsc_ordered(); sink = *ps; ls = rdtsc_ordered() - t0;
+	t0 = rdtsc_ordered(); sink = *pa; la = rdtsc_ordered() - t0;
+	t0 = rdtsc_ordered(); sink = *pc; lc = rdtsc_ordered() - t0;
+	local_irq_restore(flags);
+	(void)sink;
+
+	cbuf_n++;
+	cbuf_sig_sum += ls; cbuf_arch_sum += la; cbuf_cold_sum += lc;
+	thr = (la + lc) / 2;
+	if (ls <= thr) cbuf_warm++;
+	if (la <= thr) cbuf_arch_warm++;
+	if (lc <= thr) cbuf_cold_warm++;
+	if (ls <  lc)  cbuf_lt_cold++;
+}
+
 static int cbpf_poc_show(struct seq_file *m, void *v)
 {
 	u64 n = cpoc_n ? cpoc_n : 1;
 	u64 sn = csig_n ? csig_n : 1;
+	u64 bn = cbuf_n ? cbuf_n : 1;
 
 	seq_printf(m, "stale=0x%02x\n", (unsigned int)cbpf_poc_m0_stale);
 	seq_printf(m, "coldprobe n=%llu nfrag=%llu\n", cpoc_n, cpoc_nfrag);
@@ -258,11 +320,18 @@ static int cbpf_poc_show(struct seq_file *m, void *v)
 		   csig_sum / sn, carch_sum / sn, ccold_sum / sn);
 	seq_printf(m, "sig_sum=%llu arch_sum=%llu cold_sum=%llu\n",
 		   csig_sum, carch_sum, ccold_sum);
+	seq_printf(m, "buf n=%llu warm=%llu arch_warm=%llu cold_warm=%llu lt_cold=%llu\n",
+		   cbuf_n, cbuf_warm, cbuf_arch_warm, cbuf_cold_warm, cbuf_lt_cold);
+	seq_printf(m, "buf_lat_avg=%llu arch_lat_avg=%llu cold_lat_avg=%llu\n",
+		   cbuf_sig_sum / bn, cbuf_arch_sum / bn, cbuf_cold_sum / bn);
+	seq_printf(m, "buf_sum=%llu arch_sum=%llu cold_sum=%llu\n",
+		   cbuf_sig_sum, cbuf_arch_sum, cbuf_cold_sum);
 	return 0;
 }
 
 static int __init cbpf_poc_init(void)
 {
+	memset(cbpf_poc_buf, 0x55, sizeof(cbpf_poc_buf));  /* fault in -> reads hit RAM */
 	if (!proc_create_single("cbpf_poc", 0444, NULL, cbpf_poc_show))
 		pr_warn("cbpf_poc: failed to create /proc/cbpf_poc\n");
 	return 0;
@@ -349,10 +418,14 @@ sk_filter_trim_cap(struct sock *sk, struct sk_buff *skb, unsigned int cap)
 #endif
 #ifdef CONFIG_CBPF_KSTACK_POC
 		cbpf_poc_probe_coldness(skb);	/* verify: lat_first should now be cold */
+		if (skb->len >= CBPF_POC_BUF_MINLEN)
+			cbpf_poc_flush_buf();	/* custom buffer cold before the filter */
 #endif
 		pkt_len = bpf_prog_run_save_cb(filter->prog, skb);
 #ifdef CONFIG_CBPF_KSTACK_POC
 		cbpf_poc_probe_signal(skb);	/* time frags while SIG line still L1-hot */
+		if (skb->len >= CBPF_POC_BUF_MINLEN)
+			cbpf_poc_probe_buf();	/* time custom buffer (shallow-path channel) */
 #endif
 		skb->sk = save_sk;
 		err = pkt_len ? pskb_trim(skb, max(cap, pkt_len)) : -EPERM;
@@ -433,6 +506,20 @@ BPF_CALL_4(bpf_skb_load_helper_8, const struct sk_buff *, skb, const void *,
 {
 	u8 tmp;
 	const int len = sizeof(tmp);
+
+#ifdef CONFIG_CBPF_KSTACK_POC
+	/* Custom side-channel buffer: a P[X] offset >= CBPF_POC_BUF_BASE is served
+	 * by a single direct array deref (the shallow fast path -- see the buffer
+	 * comment above).  This executes architecturally for the M[0]=0 path and
+	 * speculatively for the SSB-bypassed stale value. */
+	if (offset >= CBPF_POC_BUF_BASE) {
+		u32 idx = (u32)offset - CBPF_POC_BUF_BASE;
+
+		if (idx < CBPF_POC_BUF_SIZE)
+			return cbpf_poc_buf[idx];
+		return 0;
+	}
+#endif
 
 	offset = bpf_skb_load_helper_convert_offset(skb, offset);
 	if (offset == INT_MIN)
