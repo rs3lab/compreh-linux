@@ -90,19 +90,60 @@
 #ifdef CONFIG_CBPF_KSTACK_POC
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/uaccess.h>
 /* Defined here; declared extern in include/linux/bpf.h under the same guard.
  * bpf_dispatcher_nop_func writes to this before every bpf_func call. */
 u8 cbpf_poc_m0_stale;
+u8 cbpf_poc_slot;
+u8 cbpf_poc_inject = 0x81;
 
 static int cbpf_poc_show(struct seq_file *m, void *v)
 {
 	seq_printf(m, "stale=0x%02x\n", (unsigned int)cbpf_poc_m0_stale);
+	seq_printf(m, "slot=%u\n", (unsigned int)cbpf_poc_slot);
+	seq_printf(m, "inject=0x%02x\n", (unsigned int)cbpf_poc_inject);
 	return 0;
 }
 
+static ssize_t cbpf_poc_write(struct file *file, const char __user *ubuf,
+			      size_t len, loff_t *ppos)
+{
+	char buf[64];
+	unsigned int slot, inject;
+
+	if (len >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, len))
+		return -EFAULT;
+	buf[len] = '\0';
+
+	if (sscanf(buf, "slot=%u inject=%x", &slot, &inject) != 2 &&
+	    sscanf(buf, "%u %x", &slot, &inject) != 2)
+		return -EINVAL;
+	if (slot > 15 || inject > 0xff)
+		return -EINVAL;
+
+	WRITE_ONCE(cbpf_poc_slot, (u8)slot);
+	WRITE_ONCE(cbpf_poc_inject, (u8)inject);
+	return len;
+}
+
+static int cbpf_poc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, cbpf_poc_show, NULL);
+}
+
+static const struct proc_ops cbpf_poc_ops = {
+	.proc_open	= cbpf_poc_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+	.proc_write	= cbpf_poc_write,
+};
+
 static int __init cbpf_poc_init(void)
 {
-	if (!proc_create_single("cbpf_poc", 0444, NULL, cbpf_poc_show))
+	if (!proc_create("cbpf_poc", 0644, NULL, &cbpf_poc_ops))
 		pr_warn("cbpf_poc: failed to create /proc/cbpf_poc\n");
 	return 0;
 }
