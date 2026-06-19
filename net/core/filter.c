@@ -94,6 +94,7 @@
 /* Defined here; declared extern in include/linux/bpf.h under the same guard.
  * bpf_dispatcher_nop_func writes to this before every bpf_func call. */
 u8 cbpf_poc_m0_stale;
+EXPORT_SYMBOL_GPL(cbpf_poc_m0_stale);
 
 /* Frag-signal probe layout -- MUST match cbpf/zc_kstack_leak.c.
  * ARCH = frag[1] (M[0]=0 architectural P[X] target, warmed every call);
