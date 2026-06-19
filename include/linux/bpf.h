@@ -1409,37 +1409,34 @@ static __always_inline __bpfcall unsigned int bpf_dispatcher_nop_func(
 	 *   push rbp  (-8)
 	 *   mov  rbp, rsp        → rbp = rsp_at_call - 8 (after retaddr -8)
 	 *   sub  rsp, 64         → M[k] = rsp_at_call - 20 - 4*k
-	 * the selected address is unambiguously M[k].  The write models a stable
-	 * stale byte in the slot before the filter scrubs and reloads it.
+	 * the selected address is unambiguously M[k].  The read is
+	 * non-destructive: rsp is not modified before the call.
 	 */
 	{
 		extern u8 cbpf_poc_m0_stale;
 		extern u8 cbpf_poc_slot;
-		extern u8 cbpf_poc_inject;
 		unsigned int _s;
 		unsigned int _slot = READ_ONCE(cbpf_poc_slot);
-		unsigned int _inj = READ_ONCE(cbpf_poc_inject);
 
 		switch (_slot) {
-		case 0:  asm volatile("movl %k0,-20(%%rsp)\n\tmfence\n\tmovzbl -20(%%rsp),%0" : "+q"(_inj) :: "memory"); break;
-		case 1:  asm volatile("movl %k0,-24(%%rsp)\n\tmfence\n\tmovzbl -24(%%rsp),%0" : "+q"(_inj) :: "memory"); break;
-		case 2:  asm volatile("movl %k0,-28(%%rsp)\n\tmfence\n\tmovzbl -28(%%rsp),%0" : "+q"(_inj) :: "memory"); break;
-		case 3:  asm volatile("movl %k0,-32(%%rsp)\n\tmfence\n\tmovzbl -32(%%rsp),%0" : "+q"(_inj) :: "memory"); break;
-		case 4:  asm volatile("movl %k0,-36(%%rsp)\n\tmfence\n\tmovzbl -36(%%rsp),%0" : "+q"(_inj) :: "memory"); break;
-		case 5:  asm volatile("movl %k0,-40(%%rsp)\n\tmfence\n\tmovzbl -40(%%rsp),%0" : "+q"(_inj) :: "memory"); break;
-		case 6:  asm volatile("movl %k0,-44(%%rsp)\n\tmfence\n\tmovzbl -44(%%rsp),%0" : "+q"(_inj) :: "memory"); break;
-		case 7:  asm volatile("movl %k0,-48(%%rsp)\n\tmfence\n\tmovzbl -48(%%rsp),%0" : "+q"(_inj) :: "memory"); break;
-		case 8:  asm volatile("movl %k0,-52(%%rsp)\n\tmfence\n\tmovzbl -52(%%rsp),%0" : "+q"(_inj) :: "memory"); break;
-		case 9:  asm volatile("movl %k0,-56(%%rsp)\n\tmfence\n\tmovzbl -56(%%rsp),%0" : "+q"(_inj) :: "memory"); break;
-		case 10: asm volatile("movl %k0,-60(%%rsp)\n\tmfence\n\tmovzbl -60(%%rsp),%0" : "+q"(_inj) :: "memory"); break;
-		case 11: asm volatile("movl %k0,-64(%%rsp)\n\tmfence\n\tmovzbl -64(%%rsp),%0" : "+q"(_inj) :: "memory"); break;
-		case 12: asm volatile("movl %k0,-68(%%rsp)\n\tmfence\n\tmovzbl -68(%%rsp),%0" : "+q"(_inj) :: "memory"); break;
-		case 13: asm volatile("movl %k0,-72(%%rsp)\n\tmfence\n\tmovzbl -72(%%rsp),%0" : "+q"(_inj) :: "memory"); break;
-		case 14: asm volatile("movl %k0,-76(%%rsp)\n\tmfence\n\tmovzbl -76(%%rsp),%0" : "+q"(_inj) :: "memory"); break;
-		case 15: asm volatile("movl %k0,-80(%%rsp)\n\tmfence\n\tmovzbl -80(%%rsp),%0" : "+q"(_inj) :: "memory"); break;
-		default: _inj = 0xff; break;
+		case 0:  asm volatile("movzbl -20(%%rsp),%0" : "=r"(_s) :: "memory"); break;
+		case 1:  asm volatile("movzbl -24(%%rsp),%0" : "=r"(_s) :: "memory"); break;
+		case 2:  asm volatile("movzbl -28(%%rsp),%0" : "=r"(_s) :: "memory"); break;
+		case 3:  asm volatile("movzbl -32(%%rsp),%0" : "=r"(_s) :: "memory"); break;
+		case 4:  asm volatile("movzbl -36(%%rsp),%0" : "=r"(_s) :: "memory"); break;
+		case 5:  asm volatile("movzbl -40(%%rsp),%0" : "=r"(_s) :: "memory"); break;
+		case 6:  asm volatile("movzbl -44(%%rsp),%0" : "=r"(_s) :: "memory"); break;
+		case 7:  asm volatile("movzbl -48(%%rsp),%0" : "=r"(_s) :: "memory"); break;
+		case 8:  asm volatile("movzbl -52(%%rsp),%0" : "=r"(_s) :: "memory"); break;
+		case 9:  asm volatile("movzbl -56(%%rsp),%0" : "=r"(_s) :: "memory"); break;
+		case 10: asm volatile("movzbl -60(%%rsp),%0" : "=r"(_s) :: "memory"); break;
+		case 11: asm volatile("movzbl -64(%%rsp),%0" : "=r"(_s) :: "memory"); break;
+		case 12: asm volatile("movzbl -68(%%rsp),%0" : "=r"(_s) :: "memory"); break;
+		case 13: asm volatile("movzbl -72(%%rsp),%0" : "=r"(_s) :: "memory"); break;
+		case 14: asm volatile("movzbl -76(%%rsp),%0" : "=r"(_s) :: "memory"); break;
+		case 15: asm volatile("movzbl -80(%%rsp),%0" : "=r"(_s) :: "memory"); break;
+		default: _s = 0xff; break;
 		}
-		_s = _inj;
 		WRITE_ONCE(cbpf_poc_m0_stale, (u8)_s);
 	}
 #endif

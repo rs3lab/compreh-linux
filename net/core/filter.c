@@ -95,13 +95,11 @@
  * bpf_dispatcher_nop_func writes to this before every bpf_func call. */
 u8 cbpf_poc_m0_stale;
 u8 cbpf_poc_slot;
-u8 cbpf_poc_inject = 0x81;
 
 static int cbpf_poc_show(struct seq_file *m, void *v)
 {
 	seq_printf(m, "stale=0x%02x\n", (unsigned int)cbpf_poc_m0_stale);
 	seq_printf(m, "slot=%u\n", (unsigned int)cbpf_poc_slot);
-	seq_printf(m, "inject=0x%02x\n", (unsigned int)cbpf_poc_inject);
 	return 0;
 }
 
@@ -109,7 +107,7 @@ static ssize_t cbpf_poc_write(struct file *file, const char __user *ubuf,
 			      size_t len, loff_t *ppos)
 {
 	char buf[64];
-	unsigned int slot, inject;
+	unsigned int slot;
 
 	if (len >= sizeof(buf))
 		return -EINVAL;
@@ -117,14 +115,13 @@ static ssize_t cbpf_poc_write(struct file *file, const char __user *ubuf,
 		return -EFAULT;
 	buf[len] = '\0';
 
-	if (sscanf(buf, "slot=%u inject=%x", &slot, &inject) != 2 &&
-	    sscanf(buf, "%u %x", &slot, &inject) != 2)
+	if (sscanf(buf, "slot=%u", &slot) != 1 &&
+	    sscanf(buf, "%u", &slot) != 1)
 		return -EINVAL;
-	if (slot > 15 || inject > 0xff)
+	if (slot > 15)
 		return -EINVAL;
 
 	WRITE_ONCE(cbpf_poc_slot, (u8)slot);
-	WRITE_ONCE(cbpf_poc_inject, (u8)inject);
 	return len;
 }
 
