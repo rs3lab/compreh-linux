@@ -92,9 +92,18 @@
 #include <linux/seq_file.h>
 #include <linux/smp.h>
 #include <asm/msr.h>
+#include <asm/msr-index.h>
 /* Defined here; declared extern in include/linux/bpf.h under the same guard.
  * bpf_dispatcher_nop_func writes to this before every bpf_func call. */
 u8 cbpf_poc_m0_stale;
+
+/* Context-valid SSBD mitigation control / model of the proposed mitigation
+ * (auto-SSBD for the socket-filter path, as the kernel already does for seccomp).
+ * The cBPF filter runs in softirq/ingress context, so a userspace prctl(SSBD) on
+ * the receiver task does NOT govern the MSR there; we instead set SPEC_CTRL.SSBD
+ * directly around the filter call, in the exact context it runs.  Toggle via
+ * /proc/cbpf_poc: 's' = on, 'r' = off. */
+static bool cbpf_poc_ssbd_filter;
 
 /* Frag-signal probe layout -- MUST match cbpf/zc_kstack_leak.c.
  * ARCH = frag[1] (M[0]=0 architectural P[X] target, warmed every call);
@@ -390,6 +399,8 @@ static int cbpf_poc_show(struct seq_file *m, void *v)
 	u64 bn = cbuf_n ? cbuf_n : 1;
 
 	seq_printf(m, "stale=0x%02x\n", (unsigned int)cbpf_poc_m0_stale);
+	seq_printf(m, "probe_enabled=%d ssbd_filter=%d thr=%llu calibrated=%d\n",
+		   cbpf_poc_probe_enabled, cbpf_poc_ssbd_filter, cpoc_thr, cpoc_calibrated);
 	seq_printf(m,
 		   "filter_cpu n=%llu pre_last=%d post_last=%d pre_mask=0x%016llx post_mask=0x%016llx migrations=%llu\n",
 		   cpoc_filter_n, cpoc_filter_pre_last, cpoc_filter_post_last,
@@ -439,6 +450,10 @@ static ssize_t cbpf_poc_write(struct file *f, const char __user *u,
 		cbpf_poc_probe_enabled = true;
 		if (!cpoc_calibrated)
 			cbpf_poc_calibrate();
+	} else if (c == 's') {
+		cbpf_poc_ssbd_filter = true;	/* SSBD around the filter (mitigation) */
+	} else if (c == 'r') {
+		cbpf_poc_ssbd_filter = false;
 	}
 	return len;
 }
@@ -560,10 +575,24 @@ sk_filter_trim_cap(struct sock *sk, struct sk_buff *skb, unsigned int cap)
 		if (skb->len >= CBPF_POC_BUF_MINLEN)
 			cbpf_poc_flush_buf();	/* custom buffer cold before the filter */
 		cpoc_filter_pre_cpu = cbpf_poc_filter_cpu_pre();
-#endif
-		pkt_len = bpf_prog_run_save_cb(filter->prog, skb);
-#ifdef CONFIG_CBPF_KSTACK_POC
+		if (cbpf_poc_ssbd_filter) {
+			/* Set SPEC_CTRL.SSBD for the filter run, in its actual
+			 * (softirq) context -- a context-valid mitigation control
+			 * and a model of auto-SSBD for the socket-filter path.
+			 * Read+restore so the kernel's own SPEC_CTRL is preserved. */
+			u64 prev;
+			rdmsrl(MSR_IA32_SPEC_CTRL, prev);
+			wrmsrl(MSR_IA32_SPEC_CTRL, prev | SPEC_CTRL_SSBD);
+			pkt_len = bpf_prog_run_save_cb(filter->prog, skb);
+			wrmsrl(MSR_IA32_SPEC_CTRL, prev);
+		} else {
+			pkt_len = bpf_prog_run_save_cb(filter->prog, skb);
+		}
 		cbpf_poc_filter_cpu_post(cpoc_filter_pre_cpu);
+#else
+		pkt_len = bpf_prog_run_save_cb(filter->prog, skb);
+#endif
+#ifdef CONFIG_CBPF_KSTACK_POC
 		if (cbpf_poc_probe_enabled) {
 			cbpf_poc_probe_signal(skb);	/* time frags while SIG line still L1-hot */
 			if (skb->len >= CBPF_POC_BUF_MINLEN)
