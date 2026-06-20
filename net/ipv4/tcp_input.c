@@ -5500,7 +5500,11 @@ end:
  * Sub-PAGE_SIZE frags are left untouched: padding them to PAGE_SIZE would
  * inflate skb->len past the TCP sequence range and corrupt copied_seq.
  */
-static void cbpf_poc_hds_emul_skb(struct sk_buff *skb)
+/* Non-static: net/core/filter.c calls this from sk_filter_trim_cap, BEFORE the
+ * filter, so the mappable page is the page the filter warms and userspace maps.
+ * The call below in tcp_queue_rcv then no-ops for already-rebuilt frags and still
+ * handles skbs that never ran a socket filter. */
+void cbpf_poc_hds_emul_skb(struct sk_buff *skb)
 {
 	struct skb_shared_info *shinfo = skb_shinfo(skb);
 	int i;

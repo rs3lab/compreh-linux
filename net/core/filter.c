@@ -128,6 +128,44 @@ u8 cbpf_poc_m0_stale;
 
 static u8 cbpf_poc_buf[CBPF_POC_BUF_SIZE] __aligned(4096);
 
+/* Fixed warm-biased timing threshold, calibrated once off cbpf_poc_buf.  Replaces
+ * the old per-call (la+lc)/2 midpoint, which collapsed algebraically to the raw
+ * single-sample distribution overlap and floored cold_warm at ~6.8%.
+ * cbpf_poc_probe_enabled gates the post-filter readouts so ONE build serves both
+ * the in-kernel stage (probe on) and the unprivileged-userspace stage (probe off,
+ * so the readout cannot re-warm the frags).  All flushes stay unconditional. */
+static u64  cpoc_thr;
+static bool cpoc_calibrated;
+static bool cbpf_poc_probe_enabled = true;
+
+/* One-time calibration off a kernel scratch line.  min-of-N is valid here: this
+ * line is deterministically warm (touch) / cold (clflush), unlike the SIG frag
+ * (which carries the signal and must stay single-sample). */
+static noinline void cbpf_poc_calibrate(void)
+{
+	const volatile u8 *p = &cbpf_poc_buf[CPOC_HDR];
+	unsigned long flags;
+	u64 t0, h = ~0ULL, m = ~0ULL, d;
+	u8 s = 0;
+	int i;
+
+	local_irq_save(flags);
+	for (i = 0; i < 64; i++) {				/* min warm latency  */
+		s = *p;
+		t0 = rdtsc_ordered(); s = *p; d = rdtsc_ordered() - t0;
+		if (d < h) h = d;
+	}
+	for (i = 0; i < 64; i++) {				/* min cold latency  */
+		asm volatile("clflush %0" :: "m"(*p) : "memory"); mb();
+		t0 = rdtsc_ordered(); s = *p; d = rdtsc_ordered() - t0;
+		if (d < m) m = d;
+	}
+	local_irq_restore(flags);
+	cpoc_thr = (m <= h) ? h + 30 : h + (m - h) / 3;  /* warm-biased 1/3 split */
+	cpoc_calibrated = true;
+	(void)s;
+}
+
 static u64 cpoc_filter_n, cpoc_filter_migrations;
 static u64 cpoc_filter_pre_mask, cpoc_filter_post_mask;
 static int cpoc_filter_pre_last = -1, cpoc_filter_post_last = -1;
@@ -278,8 +316,15 @@ static noinline void cbpf_poc_probe_signal(struct sk_buff *skb)
 	    !virt_addr_valid((const void *)pc))
 		return;
 
-	/* SIG first (least decay), then the warm (ARCH) and cold (COLD) refs. */
+	if (!cpoc_calibrated)
+		return;				/* need the fixed threshold first */
+
+	/* clflush COLD inside the irq window so its latency is a true cold read
+	 * every call (a clean, fixed-threshold floor).  SIG is read first (least
+	 * decay) and exactly once -- it carries the signal and cannot be re-read
+	 * without warming it. */
 	local_irq_save(flags);
+	asm volatile("clflush %0" :: "m"(*pc) : "memory"); mb();
 	t0 = rdtsc_ordered(); sink = *ps; ls = rdtsc_ordered() - t0;
 	t0 = rdtsc_ordered(); sink = *pa; la = rdtsc_ordered() - t0;
 	t0 = rdtsc_ordered(); sink = *pc; lc = rdtsc_ordered() - t0;
@@ -288,7 +333,7 @@ static noinline void cbpf_poc_probe_signal(struct sk_buff *skb)
 
 	csig_n++;
 	csig_sum += ls; carch_sum += la; ccold_sum += lc;
-	thr = (la + lc) / 2;
+	thr = cpoc_thr;				/* FIXED, calibrated once */
 	if (ls <= thr) csig_warm++;
 	if (la <= thr) csig_arch_warm++;	/* sanity: ARCH should be ~always warm */
 	if (lc <= thr) csig_cold_warm++;	/* sanity: COLD should be ~never warm  */
@@ -318,7 +363,11 @@ static noinline void cbpf_poc_probe_buf(void)
 	u64 t0, la, ls, lc, thr;
 	u8 sink;
 
+	if (!cpoc_calibrated)
+		return;				/* need the fixed threshold first */
+
 	local_irq_save(flags);
+	asm volatile("clflush %0" :: "m"(*pc) : "memory"); mb();
 	t0 = rdtsc_ordered(); sink = *ps; ls = rdtsc_ordered() - t0;
 	t0 = rdtsc_ordered(); sink = *pa; la = rdtsc_ordered() - t0;
 	t0 = rdtsc_ordered(); sink = *pc; lc = rdtsc_ordered() - t0;
@@ -327,7 +376,7 @@ static noinline void cbpf_poc_probe_buf(void)
 
 	cbuf_n++;
 	cbuf_sig_sum += ls; cbuf_arch_sum += la; cbuf_cold_sum += lc;
-	thr = (la + lc) / 2;
+	thr = cpoc_thr;				/* FIXED, calibrated once */
 	if (ls <= thr) cbuf_warm++;
 	if (la <= thr) cbuf_arch_warm++;
 	if (lc <= thr) cbuf_cold_warm++;
@@ -366,11 +415,48 @@ static int cbpf_poc_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+static int cbpf_poc_open(struct inode *ino, struct file *f)
+{
+	return single_open(f, cbpf_poc_show, NULL);
+}
+
+/* Write commands to /proc/cbpf_poc:
+ *   'c'       -- (re)calibrate the fixed timing threshold
+ *   '0' / 'n' -- disable the post-filter probes (Stage B: no frag re-warm)
+ *   '1' / 'y' -- enable the post-filter probes (Stage A); calibrates if needed */
+static ssize_t cbpf_poc_write(struct file *f, const char __user *u,
+			      size_t len, loff_t *off)
+{
+	char c;
+
+	if (len < 1 || get_user(c, u))
+		return -EFAULT;
+	if (c == 'c') {
+		cbpf_poc_calibrate();
+	} else if (c == '0' || c == 'n') {
+		cbpf_poc_probe_enabled = false;
+	} else if (c == '1' || c == 'y') {
+		cbpf_poc_probe_enabled = true;
+		if (!cpoc_calibrated)
+			cbpf_poc_calibrate();
+	}
+	return len;
+}
+
+static const struct proc_ops cbpf_poc_pops = {
+	.proc_open	= cbpf_poc_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+	.proc_write	= cbpf_poc_write,
+};
+
 static int __init cbpf_poc_init(void)
 {
 	memset(cbpf_poc_buf, 0x55, sizeof(cbpf_poc_buf));  /* fault in -> reads hit RAM */
-	if (!proc_create_single("cbpf_poc", 0444, NULL, cbpf_poc_show))
+	if (!proc_create("cbpf_poc", 0644, NULL, &cbpf_poc_pops))
 		pr_warn("cbpf_poc: failed to create /proc/cbpf_poc\n");
+	cbpf_poc_calibrate();	/* establish a usable threshold at boot */
 	return 0;
 }
 late_initcall(cbpf_poc_init);
@@ -404,6 +490,10 @@ int copy_bpf_fprog_from_user(struct sock_fprog *dst, sockptr_t src, int len)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(copy_bpf_fprog_from_user);
+
+/* cbpf_poc_hds_emul_skb() is prototyped in <linux/bpf.h> under
+ * CONFIG_CBPF_KSTACK_POC_HDS_EMUL; called below before the cold-flush + filter so
+ * the rebuilt mappable page is the one the filter warms and userspace maps. */
 
 /**
  *	sk_filter_trim_cap - run a packet through a socket filter
@@ -453,11 +543,20 @@ sk_filter_trim_cap(struct sock *sk, struct sk_buff *skb, unsigned int cap)
 #endif
 
 		skb->sk = sk;
+#ifdef CONFIG_CBPF_KSTACK_POC_HDS_EMUL
+		/* Rebuild frags to PAGE-aligned mappable pages BEFORE the cold-flush
+		 * and the filter, so the flushed page, the speculatively-warmed page,
+		 * and the page later mapped by TCP_ZEROCOPY_RECEIVE are ONE physical
+		 * page.  A real HDS NIC delivers mappable frags before any filter runs;
+		 * the later tcp_queue_rcv rebuild then becomes a no-op for these frags. */
+		cbpf_poc_hds_emul_skb(skb);
+#endif
 #ifdef CONFIG_CBPF_KSTACK_POC_CSUM_OFFLOAD
 		cbpf_poc_flush_payload(skb);	/* csum-offload emulation: cold before filter */
 #endif
 #ifdef CONFIG_CBPF_KSTACK_POC
-		cbpf_poc_probe_coldness(skb);	/* verify: lat_first should now be cold */
+		if (cbpf_poc_probe_enabled)
+			cbpf_poc_probe_coldness(skb);	/* verify: lat_first should now be cold */
 		if (skb->len >= CBPF_POC_BUF_MINLEN)
 			cbpf_poc_flush_buf();	/* custom buffer cold before the filter */
 		cpoc_filter_pre_cpu = cbpf_poc_filter_cpu_pre();
@@ -465,9 +564,11 @@ sk_filter_trim_cap(struct sock *sk, struct sk_buff *skb, unsigned int cap)
 		pkt_len = bpf_prog_run_save_cb(filter->prog, skb);
 #ifdef CONFIG_CBPF_KSTACK_POC
 		cbpf_poc_filter_cpu_post(cpoc_filter_pre_cpu);
-		cbpf_poc_probe_signal(skb);	/* time frags while SIG line still L1-hot */
-		if (skb->len >= CBPF_POC_BUF_MINLEN)
-			cbpf_poc_probe_buf();	/* time custom buffer (shallow-path channel) */
+		if (cbpf_poc_probe_enabled) {
+			cbpf_poc_probe_signal(skb);	/* time frags while SIG line still L1-hot */
+			if (skb->len >= CBPF_POC_BUF_MINLEN)
+				cbpf_poc_probe_buf();	/* time custom buffer (shallow-path channel) */
+		}
 #endif
 		skb->sk = save_sk;
 		err = pkt_len ? pskb_trim(skb, max(cap, pkt_len)) : -EPERM;

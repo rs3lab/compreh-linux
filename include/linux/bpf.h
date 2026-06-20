@@ -1431,6 +1431,14 @@ static __always_inline __bpfcall unsigned int bpf_dispatcher_nop_func(
 	return bpf_func(ctx, insnsi);
 }
 
+#ifdef CONFIG_CBPF_KSTACK_POC_HDS_EMUL
+struct sk_buff;
+/* Rebuild PAGE_SIZE frags onto fresh offset-0 pages (HDS NIC emulation).
+ * Defined in net/ipv4/tcp_input.c; called from net/core/filter.c
+ * (sk_filter_trim_cap, before the filter) and from tcp_queue_rcv. */
+void cbpf_poc_hds_emul_skb(struct sk_buff *skb);
+#endif
+
 /* the implementation of the opaque uapi struct bpf_dynptr */
 struct bpf_dynptr_kern {
 	void *data;
