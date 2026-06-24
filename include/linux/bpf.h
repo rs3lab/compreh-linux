@@ -1413,11 +1413,18 @@ static __always_inline __bpfcall unsigned int bpf_dispatcher_nop_func(
 	 * slot and speculatively loads the stale byte via SSB. */
 	{
 		extern u8 cbpf_poc_m0_stale;
+		extern bool cbpf_poc_inject_enabled;
 		extern u8 cbpf_poc_stale_value;
+		extern u64 cbpf_poc_stale_hist[256];
 		extern s16 cbpf_poc_stale_stack_off;
 		u8 _v = READ_ONCE(cbpf_poc_stale_value);
+		bool _inject = READ_ONCE(cbpf_poc_inject_enabled);
 		long _o = READ_ONCE(cbpf_poc_stale_stack_off);
-		asm volatile("movb %b0,(%%rsp,%1,1)" :: "q"(_v), "r"(_o) : "memory");
+		if (_inject)
+			asm volatile("movb %b0,(%%rsp,%1,1)" :: "q"(_v), "r"(_o) : "memory");
+		else
+			asm volatile("movb (%%rsp,%1,1),%b0" : "=q"(_v) : "r"(_o) : "memory");
+		WRITE_ONCE(cbpf_poc_stale_hist[_v], READ_ONCE(cbpf_poc_stale_hist[_v]) + 1);
 		WRITE_ONCE(cbpf_poc_m0_stale, _v);
 	}
 #endif
