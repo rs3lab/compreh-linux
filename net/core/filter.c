@@ -122,6 +122,14 @@ static bool cbpf_poc_ssbd_filter;
 #define CBUF_SIG_PAGE       8u          /* speculative (SSB) deref, stale bit=1  */
 #define CBUF_COLD_PAGE      4u          /* never addressed; noise floor          */
 
+/* Fixed-bucket histogram of the signal-line load latency. The single warm/cold
+ * threshold collapses each access to one bit; the histogram keeps the latency
+ * distribution so userspace can separate a true (L1-hit) leak from a slower
+ * residue that the warm threshold merges. Buckets are absolute TSC cycles:
+ * bucket b covers [b*WIDTH, (b+1)*WIDTH); the last bucket is an overflow bin. */
+#define CPOC_HIST_WIDTH     16u
+#define CPOC_HIST_BUCKETS   64u
+
 static u8 cbpf_poc_buf[CBPF_POC_BUF_SIZE] __aligned(4096);
 
 /* Fixed warm-biased timing threshold, calibrated once off cbpf_poc_buf. */
@@ -158,6 +166,7 @@ static noinline void cbpf_poc_calibrate(void)
 /* Flush the probed synthetic lines before the filter and time them after it. */
 static u64 cbuf_n, cbuf_warm, cbuf_arch_warm, cbuf_cold_warm, cbuf_lt_cold;
 static u64 cbuf_sig_sum, cbuf_arch_sum, cbuf_cold_sum;
+static u64 cbuf_sig_hist[CPOC_HIST_BUCKETS];	/* signal-line latency histogram */
 
 static void cbpf_poc_flush_buf(void)
 {
@@ -189,6 +198,12 @@ static noinline void cbpf_poc_probe_buf(void)
 
 	cbuf_n++;
 	cbuf_sig_sum += ls; cbuf_arch_sum += la; cbuf_cold_sum += lc;
+	{
+		u64 b = ls / CPOC_HIST_WIDTH;
+		if (b >= CPOC_HIST_BUCKETS)
+			b = CPOC_HIST_BUCKETS - 1;
+		cbuf_sig_hist[b]++;
+	}
 	thr = cpoc_thr;				/* FIXED, calibrated once */
 	if (ls <= thr) cbuf_warm++;
 	if (la <= thr) cbuf_arch_warm++;
@@ -199,6 +214,7 @@ static noinline void cbpf_poc_probe_buf(void)
 static int cbpf_poc_show(struct seq_file *m, void *v)
 {
 	u64 bn = cbuf_n ? cbuf_n : 1;
+	unsigned int i;
 
 	seq_printf(m, "stale=0x%08x inject=0x%08x stack_off=%d slot=%u\n",
 		   (unsigned int)cbpf_poc_m0_stale,
@@ -213,6 +229,10 @@ static int cbpf_poc_show(struct seq_file *m, void *v)
 		   cbuf_sig_sum / bn, cbuf_arch_sum / bn, cbuf_cold_sum / bn);
 	seq_printf(m, "buf_sum=%llu arch_sum=%llu cold_sum=%llu\n",
 		   cbuf_sig_sum, cbuf_arch_sum, cbuf_cold_sum);
+	seq_printf(m, "sig_hist width=%u buckets=%u", CPOC_HIST_WIDTH, CPOC_HIST_BUCKETS);
+	for (i = 0; i < CPOC_HIST_BUCKETS; i++)
+		seq_printf(m, " %llu", cbuf_sig_hist[i]);
+	seq_printf(m, "\n");
 	return 0;
 }
 
