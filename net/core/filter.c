@@ -90,8 +90,12 @@
 #ifdef CONFIG_CBPF_KSTACK_POC
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/smp.h>
 #include <asm/msr.h>
 #include <asm/msr-index.h>
+#ifdef CONFIG_CBPF_KSTACK_POC_CSUM_OFFLOAD
+#include <asm/cacheflush.h>
+#endif
 /* Defined here; declared extern in include/linux/bpf.h under the same guard.
  * bpf_dispatcher_nop_func writes to this before every bpf_func call. */
 u32 cbpf_poc_m0_stale;
@@ -108,6 +112,40 @@ u8 cbpf_poc_stale_slot;
  * /proc/cbpf_poc: 's' = on, 'r' = off. */
 static bool cbpf_poc_ssbd_filter;
 
+static bool cbpf_poc_probe_enabled = true;
+
+static u64 cpoc_filter_n, cpoc_filter_migrations;
+static u64 cpoc_filter_pre_mask, cpoc_filter_post_mask;
+static int cpoc_filter_pre_last = -1, cpoc_filter_post_last = -1;
+
+static void cbpf_poc_cpu_mask_set(u64 *mask, unsigned int cpu)
+{
+	if (cpu < 64)
+		*mask |= 1ULL << cpu;
+}
+
+static unsigned int cbpf_poc_filter_cpu_pre(void)
+{
+	unsigned int cpu = get_cpu();
+
+	cpoc_filter_n++;
+	cpoc_filter_pre_last = cpu;
+	cbpf_poc_cpu_mask_set(&cpoc_filter_pre_mask, cpu);
+	put_cpu();
+	return cpu;
+}
+
+static void cbpf_poc_filter_cpu_post(unsigned int pre_cpu)
+{
+	unsigned int cpu = get_cpu();
+
+	cpoc_filter_post_last = cpu;
+	cbpf_poc_cpu_mask_set(&cpoc_filter_post_mask, cpu);
+	if (cpu != pre_cpu)
+		cpoc_filter_migrations++;
+	put_cpu();
+}
+
 /* Synthetic direct-buffer readout for the retained receive-path cBPF SSB
  * result. A cBPF P[X] offset above CBPF_POC_BUF_BASE is served by a direct
  * cbpf_poc_buf[] dereference in bpf_skb_load_helper_8. The buffer is flushed
@@ -121,6 +159,11 @@ static bool cbpf_poc_ssbd_filter;
 #define CBUF_ARCH_PAGE      0u          /* M[k]=0 architectural deref            */
 #define CBUF_SIG_PAGE       8u          /* speculative (SSB) deref, stale bit=1  */
 #define CBUF_COLD_PAGE      4u          /* never addressed; noise floor          */
+#define CBPF_POC_BUF_MINLEN (10u * 4096u)
+
+#define CPOC_ARCH_FRAG      1
+#define CPOC_SIG_FRAG       9
+#define CPOC_COLD_FRAG      5
 
 /* Fixed-bucket histogram of the signal-line load latency. The single warm/cold
  * threshold collapses each access to one bit; the histogram keeps the latency
@@ -161,6 +204,121 @@ static noinline void cbpf_poc_calibrate(void)
 	cpoc_thr = (m <= h) ? h + 30 : h + (m - h) / 3;  /* warm-biased 1/3 split */
 	cpoc_calibrated = true;
 	(void)s;
+}
+
+static u64 cpoc_n, cpoc_nfrag;
+static u64 cpoc_first_sum, cpoc_warm_sum, cpoc_flush_sum;
+static u64 cpoc_first_min = ~0ULL, cpoc_first_max;
+
+static noinline void cbpf_poc_probe_coldness(struct sk_buff *skb)
+{
+	const volatile u8 *p;
+	unsigned long flags;
+	u64 t0, lf, lw, lc;
+	u8 sink;
+
+	if (skb_shinfo(skb)->nr_frags > 0) {
+		const skb_frag_t *f = &skb_shinfo(skb)->frags[0];
+		struct page *pg = skb_frag_page(f);
+
+		if (!pg || skb_frag_size(f) < 64)
+			return;
+		p = (const volatile u8 *)page_address(pg) + skb_frag_off(f);
+		cpoc_nfrag++;
+	} else {
+		if (skb->len < 512)
+			return;
+		p = (const volatile u8 *)skb->data + 256;
+	}
+	if (!virt_addr_valid((const void *)p))
+		return;
+
+	local_irq_save(flags);
+	t0 = rdtsc_ordered(); sink = *p; lf = rdtsc_ordered() - t0;
+	t0 = rdtsc_ordered(); sink = *p; lw = rdtsc_ordered() - t0;
+	asm volatile("clflush %0" :: "m"(*p) : "memory"); mb();
+	t0 = rdtsc_ordered(); sink = *p; lc = rdtsc_ordered() - t0;
+	local_irq_restore(flags);
+	(void)sink;
+
+	cpoc_n++;
+	cpoc_first_sum += lf;
+	cpoc_warm_sum += lw;
+	cpoc_flush_sum += lc;
+	if (lf < cpoc_first_min)
+		cpoc_first_min = lf;
+	if (lf > cpoc_first_max)
+		cpoc_first_max = lf;
+}
+
+#ifdef CONFIG_CBPF_KSTACK_POC_CSUM_OFFLOAD
+static void cbpf_poc_flush_payload(struct sk_buff *skb)
+{
+	int i;
+
+	clflush_cache_range(skb->data, skb_headlen(skb));
+	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+		const skb_frag_t *f = &skb_shinfo(skb)->frags[i];
+
+		clflush_cache_range(skb_frag_address(f), skb_frag_size(f));
+	}
+}
+#endif
+
+static u64 csig_n, csig_warm, csig_arch_warm, csig_cold_warm, csig_lt_cold;
+static u64 csig_sum, carch_sum, ccold_sum;
+
+static noinline void cbpf_poc_probe_signal(struct sk_buff *skb)
+{
+	const skb_frag_t *fa, *fs, *fc;
+	const volatile u8 *pa, *ps, *pc;
+	unsigned long flags;
+	u64 t0, la, ls, lc, thr;
+	u8 sink;
+
+	if (skb_shinfo(skb)->nr_frags <= CPOC_SIG_FRAG)
+		return;
+	fa = &skb_shinfo(skb)->frags[CPOC_ARCH_FRAG];
+	fs = &skb_shinfo(skb)->frags[CPOC_SIG_FRAG];
+	fc = &skb_shinfo(skb)->frags[CPOC_COLD_FRAG];
+	if (!skb_frag_page(fa) || !skb_frag_page(fs) || !skb_frag_page(fc))
+		return;
+	if (skb_frag_size(fa) <= CPOC_HDR || skb_frag_size(fs) <= CPOC_HDR ||
+	    skb_frag_size(fc) <= CPOC_HDR)
+		return;
+	pa = (const volatile u8 *)page_address(skb_frag_page(fa)) +
+	     skb_frag_off(fa) + CPOC_HDR;
+	ps = (const volatile u8 *)page_address(skb_frag_page(fs)) +
+	     skb_frag_off(fs) + CPOC_HDR;
+	pc = (const volatile u8 *)page_address(skb_frag_page(fc)) +
+	     skb_frag_off(fc) + CPOC_HDR;
+	if (!virt_addr_valid((const void *)pa) || !virt_addr_valid((const void *)ps) ||
+	    !virt_addr_valid((const void *)pc))
+		return;
+	if (!cpoc_calibrated)
+		return;
+
+	local_irq_save(flags);
+	asm volatile("clflush %0" :: "m"(*pc) : "memory"); mb();
+	t0 = rdtsc_ordered(); sink = *ps; ls = rdtsc_ordered() - t0;
+	t0 = rdtsc_ordered(); sink = *pa; la = rdtsc_ordered() - t0;
+	t0 = rdtsc_ordered(); sink = *pc; lc = rdtsc_ordered() - t0;
+	local_irq_restore(flags);
+	(void)sink;
+
+	csig_n++;
+	csig_sum += ls;
+	carch_sum += la;
+	ccold_sum += lc;
+	thr = cpoc_thr;
+	if (ls <= thr)
+		csig_warm++;
+	if (la <= thr)
+		csig_arch_warm++;
+	if (lc <= thr)
+		csig_cold_warm++;
+	if (ls < lc)
+		csig_lt_cold++;
 }
 
 /* Flush the probed synthetic lines before the filter and time them after it. */
@@ -213,6 +371,8 @@ static noinline void cbpf_poc_probe_buf(void)
 
 static int cbpf_poc_show(struct seq_file *m, void *v)
 {
+	u64 n = cpoc_n ? cpoc_n : 1;
+	u64 sn = csig_n ? csig_n : 1;
 	u64 bn = cbuf_n ? cbuf_n : 1;
 	unsigned int i;
 
@@ -221,8 +381,24 @@ static int cbpf_poc_show(struct seq_file *m, void *v)
 		   (unsigned int)cbpf_poc_stale_value,
 		   (int)cbpf_poc_stale_stack_off,
 		   (unsigned int)cbpf_poc_stale_slot);
-	seq_printf(m, "ssbd_filter=%d thr=%llu calibrated=%d\n",
-		   cbpf_poc_ssbd_filter, cpoc_thr, cpoc_calibrated);
+	seq_printf(m, "probe_enabled=%d ssbd_filter=%d thr=%llu calibrated=%d\n",
+		   cbpf_poc_probe_enabled, cbpf_poc_ssbd_filter, cpoc_thr, cpoc_calibrated);
+	seq_printf(m,
+		   "filter_cpu n=%llu pre_last=%d post_last=%d pre_mask=0x%016llx post_mask=0x%016llx migrations=%llu\n",
+		   cpoc_filter_n, cpoc_filter_pre_last, cpoc_filter_post_last,
+		   cpoc_filter_pre_mask, cpoc_filter_post_mask, cpoc_filter_migrations);
+	seq_printf(m, "coldprobe n=%llu nfrag=%llu\n", cpoc_n, cpoc_nfrag);
+	seq_printf(m, "lat_first_avg=%llu lat_first_min=%llu lat_first_max=%llu\n",
+		   cpoc_first_sum / n,
+		   cpoc_first_min == ~0ULL ? 0 : cpoc_first_min, cpoc_first_max);
+	seq_printf(m, "lat_warm_avg=%llu lat_flushed_avg=%llu\n",
+		   cpoc_warm_sum / n, cpoc_flush_sum / n);
+	seq_printf(m, "sig n=%llu warm=%llu arch_warm=%llu cold_warm=%llu lt_cold=%llu\n",
+		   csig_n, csig_warm, csig_arch_warm, csig_cold_warm, csig_lt_cold);
+	seq_printf(m, "sig_lat_avg=%llu arch_lat_avg=%llu cold_lat_avg=%llu\n",
+		   csig_sum / sn, carch_sum / sn, ccold_sum / sn);
+	seq_printf(m, "sig_sum=%llu arch_sum=%llu cold_sum=%llu\n",
+		   csig_sum, carch_sum, ccold_sum);
 	seq_printf(m, "buf n=%llu warm=%llu arch_warm=%llu cold_warm=%llu lt_cold=%llu\n",
 		   cbuf_n, cbuf_warm, cbuf_arch_warm, cbuf_cold_warm, cbuf_lt_cold);
 	seq_printf(m, "buf_lat_avg=%llu arch_lat_avg=%llu cold_lat_avg=%llu\n",
@@ -243,6 +419,8 @@ static int cbpf_poc_open(struct inode *ino, struct file *f)
 
 /* Write commands to /proc/cbpf_poc:
  *   'c'       -- (re)calibrate the fixed timing threshold
+ *   '0' / 'n' -- disable post-filter probes for userspace readout
+ *   '1' / 'y' -- enable post-filter probes
  *   's' / 'r' -- enable / disable SSBD around the socket-filter call
  *   'vXXXXXXXX'-- set injected 32-bit stale word to hexadecimal XXXXXXXX
  *   'mN'      -- inject into cBPF scratch word M[N]; stack_off=-20-4*N
@@ -263,6 +441,12 @@ static ssize_t cbpf_poc_write(struct file *f, const char __user *u,
 	buf[n] = '\0';
 	if (c == 'c') {
 		cbpf_poc_calibrate();
+	} else if (c == '0' || c == 'n') {
+		cbpf_poc_probe_enabled = false;
+	} else if (c == '1' || c == 'y') {
+		cbpf_poc_probe_enabled = true;
+		if (!cpoc_calibrated)
+			cbpf_poc_calibrate();
 	} else if (c == 's') {
 		cbpf_poc_ssbd_filter = true;	/* SSBD around the filter (mitigation) */
 	} else if (c == 'r') {
@@ -370,10 +554,23 @@ sk_filter_trim_cap(struct sock *sk, struct sk_buff *skb, unsigned int cap)
 	if (filter) {
 		struct sock *save_sk = skb->sk;
 		unsigned int pkt_len;
+#ifdef CONFIG_CBPF_KSTACK_POC
+		unsigned int cpoc_filter_pre_cpu = (unsigned int)-1;
+#endif
 
 		skb->sk = sk;
+#ifdef CONFIG_CBPF_KSTACK_POC_HDS_EMUL
+		cbpf_poc_hds_emul_skb(skb);
+#endif
+#ifdef CONFIG_CBPF_KSTACK_POC_CSUM_OFFLOAD
+		cbpf_poc_flush_payload(skb);
+#endif
 #ifdef CONFIG_CBPF_KSTACK_POC
-		cbpf_poc_flush_buf();
+		if (cbpf_poc_probe_enabled)
+			cbpf_poc_probe_coldness(skb);
+		if (skb->len >= CBPF_POC_BUF_MINLEN)
+			cbpf_poc_flush_buf();
+		cpoc_filter_pre_cpu = cbpf_poc_filter_cpu_pre();
 		if (cbpf_poc_ssbd_filter) {
 			/* Set SPEC_CTRL.SSBD for the filter run, in its actual
 			 * (softirq) context -- a context-valid mitigation control
@@ -387,11 +584,16 @@ sk_filter_trim_cap(struct sock *sk, struct sk_buff *skb, unsigned int cap)
 		} else {
 			pkt_len = bpf_prog_run_save_cb(filter->prog, skb);
 		}
+		cbpf_poc_filter_cpu_post(cpoc_filter_pre_cpu);
 #else
 		pkt_len = bpf_prog_run_save_cb(filter->prog, skb);
 #endif
 #ifdef CONFIG_CBPF_KSTACK_POC
-		cbpf_poc_probe_buf();
+		if (cbpf_poc_probe_enabled) {
+			cbpf_poc_probe_signal(skb);
+			if (skb->len >= CBPF_POC_BUF_MINLEN)
+				cbpf_poc_probe_buf();
+		}
 #endif
 		skb->sk = save_sk;
 		err = pkt_len ? pskb_trim(skb, max(cap, pkt_len)) : -EPERM;

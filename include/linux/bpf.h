@@ -1425,6 +1425,11 @@ static __always_inline __bpfcall unsigned int bpf_dispatcher_nop_func(
 	return bpf_func(ctx, insnsi);
 }
 
+#ifdef CONFIG_CBPF_KSTACK_POC_HDS_EMUL
+struct sk_buff;
+void cbpf_poc_hds_emul_skb(struct sk_buff *skb);
+#endif
+
 /* the implementation of the opaque uapi struct bpf_dynptr */
 struct bpf_dynptr_kern {
 	void *data;
